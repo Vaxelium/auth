@@ -166,6 +166,12 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
+        AuthRequest::Migrations { old_ids } => {
+            return match db.lock().unwrap().migrations_for(&old_ids) {
+                Ok(pairs) => AuthReply::Migrations { pairs },
+                Err(e) => AuthReply::Error { text: e.to_string() },
+            };
+        }
         AuthRequest::Locate { id } => {
             return match db.lock().unwrap().locations_of(&id) {
                 Ok(addrs) => AuthReply::Locations { addrs },
