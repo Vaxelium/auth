@@ -4,6 +4,7 @@
 //! Usage: `auth [ADDR] [DB_PATH]`
 
 mod db;
+mod mail;
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,8 +23,13 @@ const MAX_PASSWORD_LEN: usize = 128;
 
 type SharedDb = Arc<Mutex<Db>>;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Read .env before the runtime starts any threads (RESEND_API_KEY and other settings live there).
+    common::env::load();
+    tokio::runtime::Runtime::new()?.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| DEFAULT_AUTH_ADDR.to_string());
     let db_path = args.next().unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
@@ -136,6 +142,8 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
             };
         }
         AuthRequest::Profile { token } => return profile(db, &token),
+        AuthRequest::RequestEmailCode { token } => return request_email_code(db, &token),
+        AuthRequest::VerifyEmail { token, code } => return verify_email(db, &token, &code),
         AuthRequest::UpdateProfile { token, name, username } => {
             return update_profile(db, &token, name, username);
         }
@@ -223,6 +231,7 @@ fn register(db: &SharedDb, name: &str, email: &str, password: &str) -> Result<(S
     guard
         .create_session(&token, &email, now_secs())
         .map_err(|e| e.to_string())?;
+    mail::send_welcome(name.clone(), email);
     Ok((token, name))
 }
 
@@ -256,6 +265,8 @@ fn profile(db: &SharedDb, token: &str) -> AuthReply {
             name: account.name.clone(),
             username: account.username.clone(),
             email: guard.account_email(&account),
+            verified: guard.is_verified(&account.email_hash).unwrap_or(false),
+            can_verify: mail::configured(),
         },
         Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
         Err(e) => AuthReply::Error { text: e.to_string() },
@@ -305,6 +316,8 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
         name: account.name.clone(),
         username: account.username.clone(),
         email: guard.account_email(&account),
+        verified: guard.is_verified(&account.email_hash).unwrap_or(false),
+        can_verify: mail::configured(),
     }
 }
 
@@ -329,6 +342,81 @@ fn change_email(db: &SharedDb, token: &str, password: &str, new_email: &str) -> 
         Ok(false) => AuthReply::Error { text: "that email is already registered".into() },
         Err(e) => AuthReply::Error { text: e.to_string() },
     }
+}
+
+/// How long a confirmation code stays valid, in seconds.
+const CODE_SECS: u64 = 15 * 60;
+/// Wrong codes allowed before a new one has to be asked for.
+const MAX_CODE_TRIES: u32 = 5;
+/// Seconds to wait between codes.
+const CODE_WAIT_SECS: u64 = 60;
+
+/// The stored form of a code: a hash of the code, tied to the account so the same code gives a
+/// different hash for each account.
+fn code_hash(email_hash: &str, code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{email_hash}:{code}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Emails a new six-digit code to the account's address.
+fn request_email_code(db: &SharedDb, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if guard.is_verified(&account.email_hash).unwrap_or(false) {
+        return AuthReply::Error { text: "your email is already confirmed".into() };
+    }
+    let Some(email) = guard.account_email(&account) else {
+        return AuthReply::Error { text: "this account has no email address on record".into() };
+    };
+    if !mail::configured() {
+        return AuthReply::Error { text: "email sending is not set up on this server".into() };
+    }
+    let now = now_secs();
+    if let Ok(Some((_, _, _, sent))) = guard.pending_code(&account.email_hash) {
+        if now < sent + CODE_WAIT_SECS {
+            return AuthReply::Error { text: "wait a minute before asking for another code".into() };
+        }
+    }
+    let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
+    if let Err(e) = guard.store_code(&account.email_hash, &code_hash(&account.email_hash, &code), now + CODE_SECS, now) {
+        return AuthReply::Error { text: e.to_string() };
+    }
+    drop(guard);
+    mail::send_code(email, code);
+    AuthReply::CodeSent
+}
+
+/// Checks the code that was emailed, and confirms the account's address if it is right.
+fn verify_email(db: &SharedDb, token: &str, code: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    let (stored, expires, tries, _) = match guard.pending_code(&account.email_hash) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return AuthReply::Error { text: "ask for a code first".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if now_secs() > expires {
+        let _ = guard.clear_code(&account.email_hash);
+        return AuthReply::Error { text: "that code has expired, ask for a new one".into() };
+    }
+    if tries >= MAX_CODE_TRIES {
+        return AuthReply::Error { text: "too many wrong codes, ask for a new one".into() };
+    }
+    if code_hash(&account.email_hash, code.trim()) != stored {
+        let _ = guard.count_wrong_code(&account.email_hash);
+        return AuthReply::Error { text: "that code is wrong".into() };
+    }
+    let _ = guard.set_verified(&account.email_hash, true);
+    let _ = guard.clear_code(&account.email_hash);
+    AuthReply::EmailVerified
 }
 
 fn normalize_email(email: &str) -> String {

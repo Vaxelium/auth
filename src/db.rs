@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS id_migrations (
     old TEXT PRIMARY KEY,
     new TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS email_codes (
+    email_hash TEXT PRIMARY KEY,
+    code_hash  TEXT NOT NULL,
+    expires    INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    sent       INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS locations (
     account TEXT NOT NULL,
     addr    TEXT NOT NULL,
@@ -110,6 +117,8 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         // Databases made before emails could be shown lack this column.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN email_enc TEXT", []);
+        // Accounts made before email confirmation lack this column; they start unconfirmed.
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN verified INTEGER NOT NULL DEFAULT 0", []);
         // Accounts made before ids and usernames existed. An account's id starts as its name,
         // so the messages it wrote still belong to it. Its username is its name in lowercase.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN id TEXT", []);
@@ -370,8 +379,61 @@ impl Db {
             "UPDATE sessions SET email = ?1 WHERE email = ?2",
             params![new_hash, old_hash],
         )?;
+        // A new address has to be confirmed again, and any code sent to the old one no longer counts.
+        tx.execute("UPDATE accounts SET verified = 0 WHERE email = ?1", params![new_hash])?;
+        tx.execute("DELETE FROM email_codes WHERE email_hash = ?1", params![old_hash])?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// True once the account has confirmed its email address.
+    pub fn is_verified(&self, email_hash: &str) -> rusqlite::Result<bool> {
+        let verified: i64 = self.conn.query_row(
+            "SELECT verified FROM accounts WHERE email = ?1",
+            params![email_hash],
+            |row| row.get(0),
+        )?;
+        Ok(verified != 0)
+    }
+
+    pub fn set_verified(&self, email_hash: &str, verified: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET verified = ?2 WHERE email = ?1",
+            params![email_hash, verified as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The code waiting to be confirmed: (hashed code, expires, wrong tries, when it was sent).
+    pub fn pending_code(&self, email_hash: &str) -> rusqlite::Result<Option<(String, u64, u32, u64)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT code_hash, expires, attempts, sent FROM email_codes WHERE email_hash = ?1",
+                params![email_hash],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u32, row.get::<_, i64>(3)? as u64)),
+            )
+            .optional()
+    }
+
+    /// Stores a new code, replacing any earlier one, with no wrong tries yet.
+    pub fn store_code(&self, email_hash: &str, code_hash: &str, expires: u64, sent: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO email_codes (email_hash, code_hash, expires, attempts, sent) VALUES (?1, ?2, ?3, 0, ?4)",
+            params![email_hash, code_hash, expires as i64, sent as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_wrong_code(&self, email_hash: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE email_codes SET attempts = attempts + 1 WHERE email_hash = ?1", params![email_hash])?;
+        Ok(())
+    }
+
+    pub fn clear_code(&self, email_hash: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM email_codes WHERE email_hash = ?1", params![email_hash])?;
+        Ok(())
     }
 
     /// The email, encrypted with the account key as `nonce:ciphertext` in hex.
@@ -464,5 +526,36 @@ mod legacy_id_tests {
         );
         // Nothing left to migrate the second time.
         assert_eq!(db.migrate_legacy_ids().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    #[test]
+    fn an_email_is_confirmed_and_a_new_address_must_be_confirmed_again() {
+        let key = [9u8; 32];
+        let mut db = Db::open(":memory:", key).unwrap();
+        let email = "someone@example.com";
+        let email_hash = hash_email(&key, email);
+        assert!(db.create_account("Someone", "someone", email, "hash", 1).unwrap());
+        assert!(!db.is_verified(&email_hash).unwrap(), "new accounts start unconfirmed");
+
+        db.store_code(&email_hash, "code-hash", 1_000, 1).unwrap();
+        let (stored, expires, tries, sent) = db.pending_code(&email_hash).unwrap().expect("stored");
+        assert_eq!((stored.as_str(), expires, tries, sent), ("code-hash", 1_000, 0, 1));
+        db.count_wrong_code(&email_hash).unwrap();
+        assert_eq!(db.pending_code(&email_hash).unwrap().unwrap().2, 1);
+
+        db.set_verified(&email_hash, true).unwrap();
+        db.clear_code(&email_hash).unwrap();
+        assert!(db.is_verified(&email_hash).unwrap());
+        assert!(db.pending_code(&email_hash).unwrap().is_none());
+
+        // Changing the address clears the confirmation.
+        assert!(db.change_email(&email_hash, "new@example.com").unwrap());
+        let new_hash = hash_email(&key, "new@example.com");
+        assert!(!db.is_verified(&new_hash).unwrap());
     }
 }
