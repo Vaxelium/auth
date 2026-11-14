@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     email   TEXT NOT NULL,
     created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS id_migrations (
+    old TEXT PRIMARY KEY,
+    new TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS locations (
     account TEXT NOT NULL,
     addr    TEXT NOT NULL,
@@ -117,7 +121,48 @@ impl Db {
             "CREATE UNIQUE INDEX IF NOT EXISTS accounts_id ON accounts (id);
              CREATE UNIQUE INDEX IF NOT EXISTS accounts_username ON accounts (username);",
         )?;
+        db.migrate_legacy_ids()?;
         Ok(db)
+    }
+
+    /// Gives every account whose id is still its old name a random id, as new accounts get. The
+    /// change is recorded, so chat servers can follow it. Accounts already migrated are left alone.
+    fn migrate_legacy_ids(&mut self) -> rusqlite::Result<usize> {
+        let legacy: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM accounts WHERE length(id) != 32 OR id GLOB '*[^0-9a-f]*'",
+            )?;
+            let ids = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            ids
+        };
+        let tx = self.conn.transaction()?;
+        for old in &legacy {
+            let new = hex(&rand::random::<[u8; 16]>());
+            tx.execute("UPDATE accounts SET id = ?2 WHERE id = ?1", params![old, new])?;
+            tx.execute("UPDATE locations SET account = ?2 WHERE account = ?1", params![old, new])?;
+            tx.execute("INSERT OR REPLACE INTO id_migrations (old, new) VALUES (?1, ?2)", params![old, new])?;
+        }
+        tx.commit()?;
+        if !legacy.is_empty() {
+            println!("gave {} account(s) random ids", legacy.len());
+        }
+        Ok(legacy.len())
+    }
+
+    /// The new ids of the given old ids that were migrated.
+    pub fn migrations_for(&self, old_ids: &[String]) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for old in old_ids {
+            use rusqlite::OptionalExtension;
+            if let Some(new) = self
+                .conn
+                .query_row("SELECT new FROM id_migrations WHERE old = ?1", params![old], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                out.push((old.clone(), new));
+            }
+        }
+        Ok(out)
     }
 
     /// Gives every account without a username one, from its name. If the name is taken as a
@@ -367,5 +412,57 @@ impl Db {
         self.conn
             .execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn an_account_keeps_its_id_when_its_name_or_username_changes() {
+        let key = [7u8; 32];
+        let db = Db::open(":memory:", key).unwrap();
+        let email = "someone@example.com";
+        let email_hash = hash_email(&key, email);
+        assert!(db.create_account("First", "first", email, "hash", 1).unwrap());
+        let (id, name) = db.account_by_name("First").unwrap().expect("created");
+        assert_eq!(name, "First");
+
+        assert!(db.set_display_name(&email_hash, "Renamed").unwrap());
+        assert!(db.set_username(&email_hash, "renamed_user").unwrap());
+
+        assert!(db.account_by_name("First").unwrap().is_none());
+        let (same_id, new_name) = db.account_by_name("Renamed").unwrap().expect("found by new name");
+        assert_eq!(same_id, id, "the id did not change");
+        assert_eq!(new_name, "Renamed");
+    }
+}
+
+#[cfg(test)]
+mod legacy_id_tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_account_gets_a_random_id_and_the_change_is_recorded() {
+        let key = [9u8; 32];
+        let db = Db::open(":memory:", key).unwrap();
+        assert!(db.create_account("Old", "old", "old@example.com", "hash", 1).unwrap());
+        // An account from before random ids: its id is its name.
+        db.conn.execute("UPDATE accounts SET id = 'Old' WHERE name = 'Old'", []).unwrap();
+        db.conn.execute("INSERT INTO locations (account, addr, seen) VALUES ('Old', '127.0.0.1:1', 1)", []).unwrap();
+        let mut db = db;
+        assert_eq!(db.migrate_legacy_ids().unwrap(), 1);
+        let (new_id, _) = db.account_by_name("Old").unwrap().unwrap();
+        assert_ne!(new_id, "Old");
+        assert_eq!(new_id.len(), 32, "random ids are 32 hex characters");
+        assert_eq!(db.locations_of(&new_id).unwrap(), vec!["127.0.0.1:1".to_string()], "locations follow");
+        assert_eq!(
+            db.migrations_for(&["Old".to_string()]).unwrap(),
+            vec![("Old".to_string(), new_id.clone())],
+            "chat servers can ask for the change"
+        );
+        // Nothing left to migrate the second time.
+        assert_eq!(db.migrate_legacy_ids().unwrap(), 0);
     }
 }
