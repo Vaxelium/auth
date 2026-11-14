@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     email   TEXT NOT NULL,
     created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS locations (
+    account TEXT NOT NULL,
+    addr    TEXT NOT NULL,
+    seen    INTEGER NOT NULL,
+    PRIMARY KEY (account, addr)
+);
 CREATE TABLE IF NOT EXISTS tls_identity (
     id   INTEGER PRIMARY KEY CHECK (id = 1),
     cert TEXT NOT NULL,
@@ -236,6 +242,36 @@ impl Db {
     }
 
     /// The account a session token belongs to, if the token is valid.
+    /// The account with this display name, as `(id, name)`.
+    pub fn account_by_name(&self, name: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT id, name FROM accounts WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Records that an account was seen connected at a server address.
+    pub fn record_location(&self, account: &str, addr: &str, now: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO locations (account, addr, seen) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account, addr) DO UPDATE SET seen = excluded.seen",
+            params![account, addr, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The servers an account was last seen at, most recent first.
+    pub fn locations_of(&self, account: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT addr FROM locations WHERE account = ?1 ORDER BY seen DESC LIMIT 5",
+        )?;
+        let rows = stmt.query_map(params![account], |row| row.get(0))?;
+        rows.collect()
+    }
+
     pub fn session_account(&self, token: &str) -> rusqlite::Result<Option<SessionAccount>> {
         self.conn
             .query_row(
