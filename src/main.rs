@@ -148,6 +148,30 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
+        AuthRequest::Lookup { name } => {
+            return match db.lock().unwrap().account_by_name(&name) {
+                Ok(Some((id, name))) => AuthReply::Account { id, name },
+                Ok(None) => AuthReply::Error { text: format!("there is no account named {name}") },
+                Err(e) => AuthReply::Error { text: e.to_string() },
+            };
+        }
+        AuthRequest::Seen { token, addr } => {
+            let db = db.lock().unwrap();
+            return match db.session_account(&token) {
+                Ok(Some(account)) => match db.record_location(&account.id, &addr, now_secs()) {
+                    Ok(()) => AuthReply::Recorded,
+                    Err(e) => AuthReply::Error { text: e.to_string() },
+                },
+                Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
+                Err(e) => AuthReply::Error { text: e.to_string() },
+            };
+        }
+        AuthRequest::Locate { id } => {
+            return match db.lock().unwrap().locations_of(&id) {
+                Ok(addrs) => AuthReply::Locations { addrs },
+                Err(e) => AuthReply::Error { text: e.to_string() },
+            };
+        }
     };
     match result {
         Ok((token, name)) => AuthReply::Session { token, name },
