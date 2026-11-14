@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = common::tls::acceptor(&cert, &key)?;
     let db: SharedDb = Arc::new(Mutex::new(db));
     let listener = TcpListener::bind(&addr).await?;
-    println!("DissCord auth service listening on {addr} (TLS), storing accounts in {db_path}");
+    println!("Vaxelium auth service listening on {addr} (TLS), storing accounts in {db_path}");
 
     loop {
         let (socket, peer) = listener.accept().await?;
