@@ -155,7 +155,7 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
         }
         AuthRequest::ProfileCard { id } => {
             return match db.lock().unwrap().profile_card(&id) {
-                Ok(Some((name, username, bio, banner, avatar))) => AuthReply::ProfileCard { name, username, bio, banner, avatar },
+                Ok(Some((name, username, bio, banner, avatar, created))) => AuthReply::ProfileCard { name, username, bio, banner, avatar, created },
                 Ok(None) => AuthReply::Error { text: "there is no such account".into() },
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };

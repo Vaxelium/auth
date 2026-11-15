@@ -254,12 +254,12 @@ impl Db {
     }
 
     /// The public card of the account with this id: name, username, bio, banner colour and picture.
-    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String)>> {
+    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String, u64)>> {
         self.conn
             .query_row(
-                "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, '') FROM accounts WHERE id = ?1",
+                "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, ''), created FROM accounts WHERE id = ?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(5)?.max(0) as u64)),
             )
             .optional()
     }
