@@ -153,17 +153,14 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
         AuthRequest::SetStatusText { token, text } => {
             return set_status_text(db, &token, text);
         }
+        AuthRequest::SetServers { token, servers } => {
+            return set_servers(db, &token, servers);
+        }
         AuthRequest::SetAvatar { token, png_base64 } => {
             return set_avatar(db, &token, png_base64);
         }
-        AuthRequest::ProfileCard { id } => {
-            return match db.lock().unwrap().profile_card(&id) {
-                Ok(Some((name, username, bio, banner, avatar, created, status))) => {
-                    AuthReply::ProfileCard { name, username, bio, banner, avatar, created, status }
-                }
-                Ok(None) => AuthReply::Error { text: "there is no such account".into() },
-                Err(e) => AuthReply::Error { text: e.to_string() },
-            };
+        AuthRequest::ProfileCard { id, token } => {
+            return profile_card(db, &id, &token);
         }
         AuthRequest::ChangeEmail { token, password, new_email } => {
             return change_email(db, &token, &password, &new_email);
@@ -393,6 +390,57 @@ fn set_about(db: &SharedDb, token: &str, bio: String, banner: String) -> AuthRep
 }
 
 /// Sets the status text shown on the account's profile card. Empty clears it.
+/// The most servers an account can report, and the longest address.
+const MAX_SERVERS: usize = 500;
+const MAX_SERVER_ADDR_LEN: usize = 255;
+
+/// Saves the servers this account is in. Addresses are kept one per line.
+fn set_servers(db: &SharedDb, token: &str, servers: Vec<String>) -> AuthReply {
+    let mut clean: Vec<String> = servers
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SERVER_ADDR_LEN && !s.contains('\n'))
+        .collect();
+    clean.dedup();
+    clean.truncate(MAX_SERVERS);
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.set_servers(&account.email_hash, &clean.join("\n")) {
+        Ok(()) => AuthReply::ServersSaved,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// The profile card of an account. With the viewer's session, it lists the servers they share.
+fn profile_card(db: &SharedDb, id: &str, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let card = match guard.profile_card(id) {
+        Ok(Some(card)) => card,
+        Ok(None) => return AuthReply::Error { text: "there is no such account".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    let (name, username, bio, banner, avatar, created, status) = card;
+    let mutual = if token.is_empty() {
+        Vec::new()
+    } else {
+        let viewer = guard.session_account(token).ok().flatten();
+        match (viewer, guard.servers_for_id(id)) {
+            (Some(viewer), Ok(theirs)) => {
+                let viewer_servers = guard.servers_for_email(&viewer.email_hash).unwrap_or_default();
+                // The viewer's order, kept, for the servers both lists have.
+                let theirs: Vec<&str> = theirs.lines().collect();
+                viewer_servers.lines().filter(|s| theirs.contains(s)).map(String::from).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    AuthReply::ProfileCard { name, username, bio, banner, avatar, created, status, mutual }
+}
+
 fn set_status_text(db: &SharedDb, token: &str, text: String) -> AuthReply {
     let text = text.trim().to_string();
     if text.chars().count() > common::MAX_STATUS_TEXT_LEN {

@@ -126,6 +126,7 @@ impl Db {
         // Profile cards: a short bio and a banner colour. Accounts made before them lack the columns.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN status_text TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN servers TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN banner TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''", []);
         conn.execute("UPDATE accounts SET id = name WHERE id IS NULL", [])?;
@@ -231,6 +232,30 @@ impl Db {
     }
 
     /// Sets the status text of the account with this (hashed) email.
+    /// Saves the servers (addresses, one per line) that the account with this (hashed) email is in.
+    pub fn set_servers(&self, email_hash: &str, servers: &str) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE accounts SET servers = ?2 WHERE email = ?1", params![email_hash, servers])?;
+        Ok(())
+    }
+
+    /// The servers (addresses, one per line) of the account with this (hashed) email. Empty when none are known.
+    pub fn servers_for_email(&self, email_hash: &str) -> rusqlite::Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(servers, '') FROM accounts WHERE email = ?1", params![email_hash], |row| row.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// The servers (addresses, one per line) of the account with this id. Empty when none are known.
+    pub fn servers_for_id(&self, id: &str) -> rusqlite::Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(servers, '') FROM accounts WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
     pub fn set_status_text(&self, email_hash: &str, text: &str) -> rusqlite::Result<()> {
         self.conn.execute("UPDATE accounts SET status_text = ?2 WHERE email = ?1", params![email_hash, text])?;
         Ok(())
