@@ -125,6 +125,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN username TEXT", []);
         // Profile cards: a short bio and a banner colour. Accounts made before them lack the columns.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN status_text TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN banner TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''", []);
         conn.execute("UPDATE accounts SET id = name WHERE id IS NULL", [])?;
@@ -229,6 +230,12 @@ impl Db {
         )
     }
 
+    /// Sets the status text of the account with this (hashed) email.
+    pub fn set_status_text(&self, email_hash: &str, text: &str) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE accounts SET status_text = ?2 WHERE email = ?1", params![email_hash, text])?;
+        Ok(())
+    }
+
     /// Sets the bio and banner colour of the account with this (hashed) email.
     pub fn set_about(&self, email_hash: &str, bio: &str, banner: &str) -> rusqlite::Result<()> {
         self.conn.execute(
@@ -254,12 +261,12 @@ impl Db {
     }
 
     /// The public card of the account with this id: name, username, bio, banner colour and picture.
-    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String, u64)>> {
+    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String, u64, String)>> {
         self.conn
             .query_row(
-                "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, ''), created FROM accounts WHERE id = ?1",
+                "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, ''), created, COALESCE(status_text, '') FROM accounts WHERE id = ?1",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(5)?.max(0) as u64)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(5)?.max(0) as u64, row.get(6)?)),
             )
             .optional()
     }

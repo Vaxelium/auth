@@ -150,12 +150,17 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
         AuthRequest::SetAbout { token, bio, banner } => {
             return set_about(db, &token, bio, banner);
         }
+        AuthRequest::SetStatusText { token, text } => {
+            return set_status_text(db, &token, text);
+        }
         AuthRequest::SetAvatar { token, png_base64 } => {
             return set_avatar(db, &token, png_base64);
         }
         AuthRequest::ProfileCard { id } => {
             return match db.lock().unwrap().profile_card(&id) {
-                Ok(Some((name, username, bio, banner, avatar, created))) => AuthReply::ProfileCard { name, username, bio, banner, avatar, created },
+                Ok(Some((name, username, bio, banner, avatar, created, status))) => {
+                    AuthReply::ProfileCard { name, username, bio, banner, avatar, created, status }
+                }
                 Ok(None) => AuthReply::Error { text: "there is no such account".into() },
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
@@ -383,6 +388,24 @@ fn set_about(db: &SharedDb, token: &str, bio: String, banner: String) -> AuthRep
     };
     match guard.set_about(&account.email_hash, &bio, &banner) {
         Ok(()) => AuthReply::AboutSaved { bio, banner },
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Sets the status text shown on the account's profile card. Empty clears it.
+fn set_status_text(db: &SharedDb, token: &str, text: String) -> AuthReply {
+    let text = text.trim().to_string();
+    if text.chars().count() > common::MAX_STATUS_TEXT_LEN {
+        return AuthReply::Error { text: format!("the status can be at most {} characters", common::MAX_STATUS_TEXT_LEN) };
+    }
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.set_status_text(&account.email_hash, &text) {
+        Ok(()) => AuthReply::StatusTextSaved { text },
         Err(e) => AuthReply::Error { text: e.to_string() },
     }
 }
