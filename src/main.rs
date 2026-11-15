@@ -147,6 +147,19 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
         AuthRequest::UpdateProfile { token, name, username } => {
             return update_profile(db, &token, name, username);
         }
+        AuthRequest::SetAbout { token, bio, banner } => {
+            return set_about(db, &token, bio, banner);
+        }
+        AuthRequest::SetAvatar { token, png_base64 } => {
+            return set_avatar(db, &token, png_base64);
+        }
+        AuthRequest::ProfileCard { id } => {
+            return match db.lock().unwrap().profile_card(&id) {
+                Ok(Some((name, username, bio, banner, avatar))) => AuthReply::ProfileCard { name, username, bio, banner, avatar },
+                Ok(None) => AuthReply::Error { text: "there is no such account".into() },
+                Err(e) => AuthReply::Error { text: e.to_string() },
+            };
+        }
         AuthRequest::ChangeEmail { token, password, new_email } => {
             return change_email(db, &token, &password, &new_email);
         }
@@ -261,13 +274,20 @@ fn login(db: &SharedDb, email: &str, password: &str) -> Result<(String, String),
 fn profile(db: &SharedDb, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     match guard.session_account(token) {
-        Ok(Some(account)) => AuthReply::Profile {
-            name: account.name.clone(),
-            username: account.username.clone(),
-            email: guard.account_email(&account),
-            verified: guard.is_verified(&account.email_hash).unwrap_or(false),
-            can_verify: mail::configured(),
-        },
+        Ok(Some(account)) => {
+            let (bio, banner) = guard.about(&account.email_hash).unwrap_or_default();
+            let avatar = guard.avatar(&account.email_hash).unwrap_or_default();
+            AuthReply::Profile {
+                name: account.name.clone(),
+                username: account.username.clone(),
+                email: guard.account_email(&account),
+                verified: guard.is_verified(&account.email_hash).unwrap_or(false),
+                can_verify: mail::configured(),
+                bio,
+                banner,
+                avatar,
+            }
+        }
         Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
         Err(e) => AuthReply::Error { text: e.to_string() },
     }
@@ -312,12 +332,58 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
         Ok(Some(account)) => account,
         _ => return AuthReply::Error { text: "your session has expired, log in again".into() },
     };
+    let (bio, banner) = guard.about(&account.email_hash).unwrap_or_default();
+    let avatar = guard.avatar(&account.email_hash).unwrap_or_default();
     AuthReply::Profile {
         name: account.name.clone(),
         username: account.username.clone(),
         email: guard.account_email(&account),
         verified: guard.is_verified(&account.email_hash).unwrap_or(false),
         can_verify: mail::configured(),
+        bio,
+        banner,
+        avatar,
+    }
+}
+
+/// Sets or removes the session's account's profile picture.
+fn set_avatar(db: &SharedDb, token: &str, png_base64: Option<String>) -> AuthReply {
+    let avatar = png_base64.unwrap_or_default();
+    if avatar.len() > common::MAX_AVATAR_LEN {
+        return AuthReply::Error { text: "that picture is too large".into() };
+    }
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.set_avatar(&account.email_hash, &avatar) {
+        Ok(()) => AuthReply::AvatarSaved { avatar },
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Sets the bio (at most 190 characters) and the banner colour (`#rrggbb`, or empty for the default).
+fn set_about(db: &SharedDb, token: &str, bio: String, banner: String) -> AuthReply {
+    let bio = bio.trim().to_string();
+    let banner = banner.trim().to_string();
+    if bio.chars().count() > 190 {
+        return AuthReply::Error { text: "the bio can be at most 190 characters".into() };
+    }
+    let banner_ok = banner.is_empty() || (banner.len() == 7 && banner.starts_with('#') && banner[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+    if !banner_ok {
+        return AuthReply::Error { text: "the banner colour must look like #rrggbb".into() };
+    }
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.set_about(&account.email_hash, &bio, &banner) {
+        Ok(()) => AuthReply::AboutSaved { bio, banner },
+        Err(e) => AuthReply::Error { text: e.to_string() },
     }
 }
 

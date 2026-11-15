@@ -123,6 +123,10 @@ impl Db {
         // so the messages it wrote still belong to it. Its username is its name in lowercase.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN id TEXT", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN username TEXT", []);
+        // Profile cards: a short bio and a banner colour. Accounts made before them lack the columns.
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN banner TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''", []);
         conn.execute("UPDATE accounts SET id = name WHERE id IS NULL", [])?;
         let mut db = Self { conn, key };
         db.fill_usernames()?;
@@ -214,6 +218,50 @@ impl Db {
             "UPDATE accounts SET name = ?1 WHERE email = ?2",
             params![name, email_hash],
         ))
+    }
+
+    /// The bio and banner colour of the account with this (hashed) email.
+    pub fn about(&self, email_hash: &str) -> rusqlite::Result<(String, String)> {
+        self.conn.query_row(
+            "SELECT COALESCE(bio, ''), COALESCE(banner, '') FROM accounts WHERE email = ?1",
+            params![email_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
+    /// Sets the bio and banner colour of the account with this (hashed) email.
+    pub fn set_about(&self, email_hash: &str, bio: &str, banner: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET bio = ?2, banner = ?3 WHERE email = ?1",
+            params![email_hash, bio, banner],
+        )?;
+        Ok(())
+    }
+
+    /// The profile picture of the account with this (hashed) email, or empty for none.
+    pub fn avatar(&self, email_hash: &str) -> rusqlite::Result<String> {
+        self.conn.query_row(
+            "SELECT COALESCE(avatar, '') FROM accounts WHERE email = ?1",
+            params![email_hash],
+            |row| row.get(0),
+        )
+    }
+
+    /// Sets the profile picture of the account with this (hashed) email.
+    pub fn set_avatar(&self, email_hash: &str, avatar: &str) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE accounts SET avatar = ?2 WHERE email = ?1", params![email_hash, avatar])?;
+        Ok(())
+    }
+
+    /// The public card of the account with this id: name, username, bio, banner colour and picture.
+    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, '') FROM accounts WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
     }
 
     /// Sets the username for the account with this (hashed) email. Returns `false` if it is taken.
