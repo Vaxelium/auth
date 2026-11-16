@@ -210,6 +210,8 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
             };
         }
         AuthRequest::DiscordStart { redirect_uri } => return discord_start(&redirect_uri),
+        AuthRequest::LinkedAccounts { token } => return linked_accounts(db, &token),
+        AuthRequest::UnlinkDiscord { token } => return unlink_discord(db, &token),
         // Handled in `handle_connection`, which can wait for Discord.
         AuthRequest::DiscordLogin { .. } => Err("the Discord login is handled separately".to_string()),
     };
@@ -301,6 +303,44 @@ fn discord_start(redirect_uri: &str) -> AuthReply {
     }
 }
 
+/// The Discord account linked to the session's account, and whether the link can be removed.
+fn linked_accounts(db: &SharedDb, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.linked_discord_label(&account.id) {
+        Ok(label) => AuthReply::LinkedAccounts {
+            // Links made before names were stored have an empty label.
+            discord: label.map(|name| if name.is_empty() { "a Discord account".to_string() } else { name }),
+            // An account made by Discord has no password. Unlinking would leave it with no way to log in.
+            can_unlink_discord: !account.password_hash.is_empty(),
+        },
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Removes the Discord link of the session's account, if it has a password to log in with.
+fn unlink_discord(db: &SharedDb, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if account.password_hash.is_empty() {
+        return AuthReply::Error {
+            text: "this account signs in with Discord only, so its Discord link cannot be removed".into(),
+        };
+    }
+    match guard.unlink_discord(&account.id) {
+        Ok(()) => AuthReply::DiscordUnlinked,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
 /// Trades the Discord code for the account's details, then logs in. Returns `(token, name)`.
 async fn discord_login(db: &SharedDb, code: &str, redirect_uri: &str) -> Result<(String, String), String> {
     let config = discord::config().ok_or_else(|| DISCORD_NOT_SET_UP.to_string())?;
@@ -320,6 +360,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         (Some(email), Some(true)) => normalize_email(email),
         _ => return Err("your Discord email address has to be confirmed to log in with Discord".into()),
     };
+    let label = user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username).to_string();
     let guard = db.lock().unwrap();
     let token = new_token();
     let now = now_secs();
@@ -327,6 +368,8 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
 
     if let Some(id) = guard.discord_account(&user.id).map_err(map)? {
         if let Some(name) = guard.name_of_account(&id).map_err(map)? {
+            // The Discord name may have changed since the link was made, so it is refreshed.
+            guard.link_discord(&user.id, &id, &label).map_err(map)?;
             guard.create_session_for_account(&token, &id, now).map_err(map)?;
             return Ok((token, name));
         }
@@ -336,7 +379,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         if !verified {
             return Err("an account with this email exists but its email is not confirmed. Log in with its password and confirm the email, then try Discord again".into());
         }
-        guard.link_discord(&user.id, &id).map_err(map)?;
+        guard.link_discord(&user.id, &id, &label).map_err(map)?;
         guard.create_session_for_account(&token, &id, now).map_err(map)?;
         return Ok((token, name));
     }
@@ -354,7 +397,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         .create_discord_account(&name, &username, &email, now)
         .map_err(map)?
         .ok_or_else(|| "that name or email is already registered".to_string())?;
-    guard.link_discord(&user.id, &id).map_err(map)?;
+    guard.link_discord(&user.id, &id, &label).map_err(map)?;
     guard.create_session_for_account(&token, &id, now).map_err(map)?;
     drop(guard);
     mail::send_welcome(name.clone(), email);
@@ -767,6 +810,39 @@ mod discord_tests {
         let err = finish_discord(&db, &discord_user("333", "Ivy", Some("ivy@example.com"), Some(true))).unwrap_err();
         assert!(err.contains("not confirmed"), "{err}");
         assert!(db.lock().unwrap().discord_account("333").unwrap().is_none(), "no link was made");
+    }
+
+    #[test]
+    fn a_discord_only_account_cannot_unlink_discord_but_a_password_account_can() {
+        let db = shared();
+        let (discord_token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
+        match linked_accounts(&db, &discord_token) {
+            AuthReply::LinkedAccounts { discord, can_unlink_discord } => {
+                assert_eq!(discord.as_deref(), Some("Sky"));
+                assert!(!can_unlink_discord, "a Discord-only account has no password to fall back on");
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(matches!(unlink_discord(&db, &discord_token), AuthReply::Error { .. }));
+
+        let (kai_token, _) = register(&db, "Kai", "kai@example.com", "a password here").unwrap();
+        {
+            let guard = db.lock().unwrap();
+            let id = guard.session_account(&kai_token).unwrap().unwrap().id;
+            guard.link_discord("222", &id, "Kai on Discord").unwrap();
+        }
+        match linked_accounts(&db, &kai_token) {
+            AuthReply::LinkedAccounts { discord, can_unlink_discord } => {
+                assert_eq!(discord.as_deref(), Some("Kai on Discord"));
+                assert!(can_unlink_discord);
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(matches!(unlink_discord(&db, &kai_token), AuthReply::DiscordUnlinked));
+        assert!(matches!(
+            linked_accounts(&db, &kai_token),
+            AuthReply::LinkedAccounts { discord: None, .. }
+        ));
     }
 
     #[test]

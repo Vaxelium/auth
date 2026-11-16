@@ -133,6 +133,8 @@ impl Db {
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN servers TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN banner TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''", []);
+        // The Discord name shown in the account's settings. Links made before it existed have none.
+        let _ = conn.execute("ALTER TABLE discord_links ADD COLUMN label TEXT NOT NULL DEFAULT ''", []);
         conn.execute("UPDATE accounts SET id = name WHERE id IS NULL", [])?;
         let mut db = Self { conn, key };
         db.fill_usernames()?;
@@ -560,11 +562,29 @@ impl Db {
             .optional()
     }
 
-    pub fn link_discord(&self, discord_id: &str, account_id: &str) -> rusqlite::Result<()> {
+    /// Links a Discord account to an account. `label` is the Discord name to show in settings.
+    pub fn link_discord(&self, discord_id: &str, account_id: &str, label: &str) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO discord_links (discord_id, account) VALUES (?1, ?2)",
-            params![discord_id, account_id],
+            "INSERT OR REPLACE INTO discord_links (discord_id, account, label) VALUES (?1, ?2, ?3)",
+            params![discord_id, account_id, label],
         )?;
+        Ok(())
+    }
+
+    /// The Discord name linked to the account with this id, if any.
+    pub fn linked_discord_label(&self, account_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT label FROM discord_links WHERE account = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Removes the Discord link of the account with this id.
+    pub fn unlink_discord(&self, account_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM discord_links WHERE account = ?1", params![account_id])?;
         Ok(())
     }
 
@@ -719,7 +739,7 @@ mod discord_tests {
             .unwrap()
             .expect("created");
         assert!(db.is_verified(&hash_email(&key, old_email)).unwrap(), "Discord confirmed the email");
-        db.link_discord("discord-1", &id).unwrap();
+        db.link_discord("discord-1", &id, "Sky").unwrap();
 
         assert!(db.change_email(&hash_email(&key, old_email), "after@example.com").unwrap());
         db.create_session_for_account("token-1", &id, 2).unwrap();
