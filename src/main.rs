@@ -4,6 +4,7 @@
 //! Usage: `auth [ADDR] [DB_PATH]`
 
 mod db;
+mod discord;
 mod mail;
 
 use std::sync::{Arc, Mutex};
@@ -120,6 +121,13 @@ where
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<AuthRequest>(&line) {
+            // Talks to Discord over the network, so it runs here rather than in `handle_request`.
+            Ok(AuthRequest::DiscordLogin { code, redirect_uri }) => {
+                match discord_login(&db, &code, &redirect_uri).await {
+                    Ok((token, name)) => AuthReply::Session { token, name },
+                    Err(text) => AuthReply::Error { text },
+                }
+            }
             Ok(request) => handle_request(&db, request),
             Err(e) => AuthReply::Error { text: format!("bad request: {e}") },
         };
@@ -201,6 +209,9 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
+        AuthRequest::DiscordStart { redirect_uri } => return discord_start(&redirect_uri),
+        // Handled in `handle_connection`, which can wait for Discord.
+        AuthRequest::DiscordLogin { .. } => Err("the Discord login is handled separately".to_string()),
     };
     match result {
         Ok((token, name)) => AuthReply::Session { token, name },
@@ -270,6 +281,98 @@ fn login(db: &SharedDb, email: &str, password: &str) -> Result<(String, String),
         .create_session(&token, &email, now_secs())
         .map_err(|e| e.to_string())?;
     Ok((token, account.name))
+}
+
+const DISCORD_NOT_SET_UP: &str = "login with Discord is not set up on this server";
+
+/// Starts a Discord login. The state is random and goes back to the client with the code, so the
+/// client can tell the callback belongs to the login it started.
+fn discord_start(redirect_uri: &str) -> AuthReply {
+    let Some(config) = discord::config() else {
+        return AuthReply::Error { text: DISCORD_NOT_SET_UP.into() };
+    };
+    if let Err(text) = discord::check_redirect(redirect_uri) {
+        return AuthReply::Error { text };
+    }
+    let state = new_token();
+    match discord::authorize_url(&config, redirect_uri, &state) {
+        Ok(url) => AuthReply::DiscordUrl { url, state },
+        Err(text) => AuthReply::Error { text },
+    }
+}
+
+/// Trades the Discord code for the account's details, then logs in. Returns `(token, name)`.
+async fn discord_login(db: &SharedDb, code: &str, redirect_uri: &str) -> Result<(String, String), String> {
+    let config = discord::config().ok_or_else(|| DISCORD_NOT_SET_UP.to_string())?;
+    discord::check_redirect(redirect_uri)?;
+    let user = discord::fetch_user(&config, code, redirect_uri).await?;
+    // No lock is held across the network calls above; only the database work below uses it.
+    finish_discord(db, &user)
+}
+
+/// Finds or makes the account for a Discord user. The rules, in order:
+/// 1. A Discord account already linked to an account logs in to that account.
+/// 2. A Discord email that matches an account links to it, but only when that account has confirmed
+///    its email. An unconfirmed account could have been registered by someone else with that address.
+/// 3. Otherwise a new account is made, with the Discord name and no password.
+fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String, String), String> {
+    let email = match (&user.email, user.verified) {
+        (Some(email), Some(true)) => normalize_email(email),
+        _ => return Err("your Discord email address has to be confirmed to log in with Discord".into()),
+    };
+    let guard = db.lock().unwrap();
+    let token = new_token();
+    let now = now_secs();
+    let map = |e: rusqlite::Error| e.to_string();
+
+    if let Some(id) = guard.discord_account(&user.id).map_err(map)? {
+        if let Some(name) = guard.name_of_account(&id).map_err(map)? {
+            guard.create_session_for_account(&token, &id, now).map_err(map)?;
+            return Ok((token, name));
+        }
+        // The linked account was removed, so the link is made again below.
+    }
+    if let Some((id, name, verified)) = guard.account_by_email(&email).map_err(map)? {
+        if !verified {
+            return Err("an account with this email exists but its email is not confirmed. Log in with its password and confirm the email, then try Discord again".into());
+        }
+        guard.link_discord(&user.id, &id).map_err(map)?;
+        guard.create_session_for_account(&token, &id, now).map_err(map)?;
+        return Ok((token, name));
+    }
+
+    let name_base = user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username);
+    let name = free_name(&guard, name_base).map_err(map)?;
+    let base = db::username_from(&name);
+    let mut username = base.clone();
+    let mut n = 2;
+    while guard.username_taken(&username).map_err(map)? {
+        username = format!("{base}{n}");
+        n += 1;
+    }
+    let id = guard
+        .create_discord_account(&name, &username, &email, now)
+        .map_err(map)?
+        .ok_or_else(|| "that name or email is already registered".to_string())?;
+    guard.link_discord(&user.id, &id).map_err(map)?;
+    guard.create_session_for_account(&token, &id, now).map_err(map)?;
+    drop(guard);
+    mail::send_welcome(name.clone(), email);
+    Ok((token, name))
+}
+
+/// The name, trimmed and cut to the longest allowed. If another account has it, a number is added.
+fn free_name(guard: &db::Db, base: &str) -> rusqlite::Result<String> {
+    let base: String = base.chars().take(MAX_NAME_LEN).collect();
+    let base = if base.trim().is_empty() { "discord user".to_string() } else { base };
+    let mut name = base.clone();
+    let mut n = 2;
+    while guard.account_by_name(&name)?.is_some() {
+        let stem: String = base.chars().take(MAX_NAME_LEN - 4).collect();
+        name = format!("{stem} {n}");
+        n += 1;
+    }
+    Ok(name)
 }
 
 /// The account's name and email, for the session's owner.
@@ -588,4 +691,89 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    use discord::DiscordUser;
+
+    const KEY: [u8; 32] = [3; 32];
+
+    fn shared() -> SharedDb {
+        Arc::new(Mutex::new(Db::open(":memory:", KEY).unwrap()))
+    }
+
+    fn discord_user(id: &str, name: &str, email: Option<&str>, verified: Option<bool>) -> DiscordUser {
+        DiscordUser {
+            id: id.into(),
+            username: name.to_lowercase(),
+            global_name: Some(name.into()),
+            email: email.map(String::from),
+            verified,
+        }
+    }
+
+    fn name_of_session(db: &SharedDb, token: &str) -> Option<String> {
+        db.lock().unwrap().session_account(token).unwrap().map(|a| a.name)
+    }
+
+    #[test]
+    fn a_new_discord_user_gets_an_account_that_logs_in_again() {
+        let db = shared();
+        let (token, name) = finish_discord(&db, &discord_user("111", "Sky", Some("Sky@Example.com"), Some(true))).unwrap();
+        assert_eq!(name, "Sky");
+        assert_eq!(name_of_session(&db, &token).as_deref(), Some("Sky"));
+
+        // Discord's name has changed since, but the same Discord account finds the same account.
+        let (_, again) = finish_discord(&db, &discord_user("111", "Sky Renamed", Some("sky@example.com"), Some(true))).unwrap();
+        assert_eq!(again, "Sky");
+    }
+
+    #[test]
+    fn a_discord_account_has_no_password_so_password_login_cannot_reach_it() {
+        let db = shared();
+        finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
+        assert!(login(&db, "sky@example.com", "any password at all").is_err());
+    }
+
+    #[test]
+    fn a_discord_email_that_is_not_confirmed_by_discord_is_refused() {
+        let db = shared();
+        assert!(finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(false))).is_err());
+        assert!(finish_discord(&db, &discord_user("111", "Sky", None, Some(true))).is_err());
+        assert!(finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), None)).is_err());
+    }
+
+    #[test]
+    fn a_confirmed_account_with_the_same_email_is_linked() {
+        let db = shared();
+        {
+            let guard = db.lock().unwrap();
+            assert!(guard.create_account("Kai", "kai", "kai@example.com", "some-hash", 1).unwrap());
+            guard.set_verified(&db::hash_email(&KEY, "kai@example.com"), true).unwrap();
+        }
+        let (token, name) = finish_discord(&db, &discord_user("222", "Kai on Discord", Some("kai@example.com"), Some(true))).unwrap();
+        assert_eq!(name, "Kai", "logs in to the existing account");
+        assert_eq!(name_of_session(&db, &token).as_deref(), Some("Kai"));
+        // Linked now, so the next Discord login does not need the email again.
+        assert!(db.lock().unwrap().discord_account("222").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unconfirmed_account_with_the_same_email_is_not_taken_over() {
+        let db = shared();
+        db.lock().unwrap().create_account("Ivy", "ivy", "ivy@example.com", "some-hash", 1).unwrap();
+        let err = finish_discord(&db, &discord_user("333", "Ivy", Some("ivy@example.com"), Some(true))).unwrap_err();
+        assert!(err.contains("not confirmed"), "{err}");
+        assert!(db.lock().unwrap().discord_account("333").unwrap().is_none(), "no link was made");
+    }
+
+    #[test]
+    fn a_taken_display_name_gets_a_number() {
+        let db = shared();
+        finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
+        let (_, name) = finish_discord(&db, &discord_user("444", "Sky", Some("other@example.com"), Some(true))).unwrap();
+        assert_eq!(name, "Sky 2");
+    }
 }

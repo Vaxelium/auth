@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS tls_identity (
     cert TEXT NOT NULL,
     key  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS discord_links (
+    discord_id TEXT PRIMARY KEY,
+    account    TEXT NOT NULL
+);
 ";
 
 /// The account behind a session token.
@@ -104,7 +108,7 @@ pub struct Db {
 
 /// Hashes an email (already trimmed and lowercased) with the secret key. The result is what is
 /// stored in place of the address, so the database alone does not reveal anyone's email.
-fn hash_email(key: &[u8; 32], email: &str) -> String {
+pub(crate) fn hash_email(key: &[u8; 32], email: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key);
     hasher.update(email.as_bytes());
@@ -534,6 +538,67 @@ impl Db {
         Ok(())
     }
 
+    /// Starts a session for the account with this id. Used for Discord logins, which find the
+    /// account by its id, so the session follows it even after its email changes.
+    pub fn create_session_for_account(&self, token: &str, account_id: &str, now: u64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (token, email, created)
+             SELECT ?1, email, ?3 FROM accounts WHERE id = ?2",
+            params![token, account_id, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The account id linked to this Discord account, if any.
+    pub fn discord_account(&self, discord_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT account FROM discord_links WHERE discord_id = ?1",
+                params![discord_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn link_discord(&self, discord_id: &str, account_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO discord_links (discord_id, account) VALUES (?1, ?2)",
+            params![discord_id, account_id],
+        )?;
+        Ok(())
+    }
+
+    /// The display name of the account with this id.
+    pub fn name_of_account(&self, account_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT name FROM accounts WHERE id = ?1", params![account_id], |row| row.get(0))
+            .optional()
+    }
+
+    /// The id, display name and confirmed flag of the account with this email.
+    pub fn account_by_email(&self, email: &str) -> rusqlite::Result<Option<(String, String, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT id, name, verified FROM accounts WHERE email = ?1",
+                params![hash_email(&self.key, email)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+            )
+            .optional()
+    }
+
+    /// Creates an account for a Discord login. Its email is already confirmed by Discord, and it has
+    /// no password, so password login can never reach it. Returns the new id, or `None` when the
+    /// name, username or email is taken.
+    pub fn create_discord_account(&self, name: &str, username: &str, email: &str, now: u64) -> rusqlite::Result<Option<String>> {
+        if !self.create_account(name, username, email, "", now)? {
+            return Ok(None);
+        }
+        self.set_verified(&hash_email(&self.key, email), true)?;
+        self.conn
+            .query_row("SELECT id FROM accounts WHERE email = ?1", params![hash_email(&self.key, email)], |row| row.get(0))
+            .optional()
+    }
+
     /// The display name a session token belongs to, if the token is valid.
     /// The stored TLS certificate and key (PEM), if one has been made.
     pub fn tls_identity(&self) -> rusqlite::Result<Option<(String, String)>> {
@@ -637,5 +702,30 @@ mod verify_tests {
         assert!(db.change_email(&email_hash, "new@example.com").unwrap());
         let new_hash = hash_email(&key, "new@example.com");
         assert!(!db.is_verified(&new_hash).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+
+    #[test]
+    fn a_discord_login_follows_its_account_when_the_email_changes() {
+        let key = [4u8; 32];
+        let mut db = Db::open(":memory:", key).unwrap();
+        let old_email = "before@example.com";
+        let id = db
+            .create_discord_account("Sky", "sky", old_email, 1)
+            .unwrap()
+            .expect("created");
+        assert!(db.is_verified(&hash_email(&key, old_email)).unwrap(), "Discord confirmed the email");
+        db.link_discord("discord-1", &id).unwrap();
+
+        assert!(db.change_email(&hash_email(&key, old_email), "after@example.com").unwrap());
+        db.create_session_for_account("token-1", &id, 2).unwrap();
+        let account = db.session_account("token-1").unwrap().expect("session");
+        assert_eq!(account.id, id);
+        assert_eq!(account.email_hash, hash_email(&key, "after@example.com"));
+        assert_eq!(db.discord_account("discord-1").unwrap(), Some(id), "the link still holds");
     }
 }
