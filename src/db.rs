@@ -551,6 +551,32 @@ impl Db {
         Ok(())
     }
 
+    /// Sets the password hash of the account with this (hashed) email.
+    pub fn set_password_hash(&self, email_hash: &str, password_hash: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET password_hash = ?2 WHERE email = ?1",
+            params![email_hash, password_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the account with this (hashed) email, with its sessions, Discord link, pending codes
+    /// and recorded locations, in one step.
+    pub fn delete_account(&mut self, email_hash: &str) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        let id: Option<String> = tx
+            .query_row("SELECT id FROM accounts WHERE email = ?1", params![email_hash], |row| row.get(0))
+            .optional()?;
+        if let Some(id) = id {
+            tx.execute("DELETE FROM discord_links WHERE account = ?1", params![id])?;
+            tx.execute("DELETE FROM locations WHERE account = ?1", params![id])?;
+        }
+        tx.execute("DELETE FROM sessions WHERE email = ?1", params![email_hash])?;
+        tx.execute("DELETE FROM email_codes WHERE email_hash = ?1", params![email_hash])?;
+        tx.execute("DELETE FROM accounts WHERE email = ?1", params![email_hash])?;
+        tx.commit()
+    }
+
     /// The account id linked to this Discord account, if any.
     pub fn discord_account(&self, discord_id: &str) -> rusqlite::Result<Option<String>> {
         self.conn
@@ -747,5 +773,45 @@ mod discord_tests {
         assert_eq!(account.id, id);
         assert_eq!(account.email_hash, hash_email(&key, "after@example.com"));
         assert_eq!(db.discord_account("discord-1").unwrap(), Some(id), "the link still holds");
+    }
+}
+
+#[cfg(test)]
+mod account_action_tests {
+    use super::*;
+
+    #[test]
+    fn deleting_an_account_removes_everything_it_left_behind() {
+        let key = [5u8; 32];
+        let mut db = Db::open(":memory:", key).unwrap();
+        let email = "gone@example.com";
+        let email_hash = hash_email(&key, email);
+        let id = db.create_discord_account("Gone", "gone", email, 1).unwrap().expect("created");
+        db.link_discord("discord-9", &id, "Gone").unwrap();
+        db.record_location(&id, "127.0.0.1:7878", 1).unwrap();
+        db.create_session_for_account("token-9", &id, 1).unwrap();
+        db.store_code(&email_hash, "code", 99, 1).unwrap();
+
+        db.delete_account(&email_hash).unwrap();
+
+        assert!(db.session_account("token-9").unwrap().is_none());
+        assert!(db.discord_account("discord-9").unwrap().is_none());
+        assert!(db.locations_of(&id).unwrap().is_empty());
+        assert!(db.pending_code(&email_hash).unwrap().is_none());
+        assert!(db.account_by_email(email).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_password_can_be_set_on_a_discord_account() {
+        let key = [6u8; 32];
+        let db = Db::open(":memory:", key).unwrap();
+        let email = "pw@example.com";
+        let email_hash = hash_email(&key, email);
+        db.create_discord_account("Pat", "pat", email, 1).unwrap().expect("created");
+        db.create_session_for_account("token-pw", &db.account_by_email(email).unwrap().unwrap().0, 1).unwrap();
+        assert!(db.session_account("token-pw").unwrap().unwrap().password_hash.is_empty());
+
+        db.set_password_hash(&email_hash, "new-hash").unwrap();
+        assert_eq!(db.session_account("token-pw").unwrap().unwrap().password_hash, "new-hash");
     }
 }

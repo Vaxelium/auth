@@ -7,6 +7,7 @@ mod db;
 mod discord;
 mod mail;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +16,7 @@ use argon2::Argon2;
 use common::{is_valid_email, AuthReply, AuthRequest, DEFAULT_AUTH_ADDR};
 use db::{username_from, Db};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 const DEFAULT_DB_PATH: &str = "auth.db";
 const MAX_NAME_LEN: usize = 24;
@@ -52,12 +53,22 @@ async fn run() -> anyhow::Result<()> {
     };
     let acceptor = common::tls::acceptor(&cert, &key)?;
     let db: SharedDb = Arc::new(Mutex::new(db));
+    let pending: PendingLogins = Arc::default();
+    if let Some(config) = discord::config() {
+        let pending = pending.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_discord_callbacks(config.callback_addr, pending).await {
+                eprintln!("Discord callbacks stopped: {e}");
+            }
+        });
+    }
     let listener = TcpListener::bind(&addr).await?;
     println!("Vaxelium auth service listening on {addr} (TLS), storing accounts in {db_path}");
 
     loop {
         let (socket, peer) = listener.accept().await?;
         let db = db.clone();
+        let pending = pending.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let socket = match acceptor.accept(socket).await {
@@ -67,7 +78,7 @@ async fn run() -> anyhow::Result<()> {
                     return;
                 }
             };
-            if let Err(e) = handle_connection(socket, db).await {
+            if let Err(e) = handle_connection(socket, db, pending).await {
                 if !common::tls::is_quiet_close(&e) {
                     eprintln!("{peer}: {e}");
                 }
@@ -113,7 +124,7 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 /// Reads requests line by line until the client disconnects.
-async fn handle_connection<S>(socket: S, db: SharedDb) -> anyhow::Result<()>
+async fn handle_connection<S>(socket: S, db: SharedDb, pending: PendingLogins) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -122,13 +133,8 @@ where
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<AuthRequest>(&line) {
             // Talks to Discord over the network, so it runs here rather than in `handle_request`.
-            Ok(AuthRequest::DiscordLogin { code, redirect_uri }) => {
-                match discord_login(&db, &code, &redirect_uri).await {
-                    Ok((token, name)) => AuthReply::Session { token, name },
-                    Err(text) => AuthReply::Error { text },
-                }
-            }
-            Ok(request) => handle_request(&db, request),
+            Ok(AuthRequest::DiscordPoll { state }) => discord_poll(&db, &pending, &state).await,
+            Ok(request) => handle_request(&db, &pending, request),
             Err(e) => AuthReply::Error { text: format!("bad request: {e}") },
         };
         let mut out = serde_json::to_string(&reply)?;
@@ -138,7 +144,7 @@ where
     Ok(())
 }
 
-fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
+fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) -> AuthReply {
     let result = match request {
         AuthRequest::Register { name, email, password } => register(db, &name, &email, &password),
         AuthRequest::Login { email, password } => login(db, &email, &password),
@@ -209,11 +215,13 @@ fn handle_request(db: &SharedDb, request: AuthRequest) -> AuthReply {
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
-        AuthRequest::DiscordStart { redirect_uri } => return discord_start(&redirect_uri),
+        AuthRequest::DiscordStart { token } => return discord_start(db, pending, &token),
+        AuthRequest::SetPassword { token, password } => return set_password(db, &token, &password),
+        AuthRequest::DeleteAccount { token, password } => return delete_account(db, &token, &password),
         AuthRequest::LinkedAccounts { token } => return linked_accounts(db, &token),
         AuthRequest::UnlinkDiscord { token } => return unlink_discord(db, &token),
-        // Handled in `handle_connection`, which can wait for Discord.
-        AuthRequest::DiscordLogin { .. } => Err("the Discord login is handled separately".to_string()),
+        // Handled in `handle_connection`, because it talks to Discord.
+        AuthRequest::DiscordPoll { .. } => Err("the Discord login is handled separately".to_string()),
     };
     match result {
         Ok((token, name)) => AuthReply::Session { token, name },
@@ -286,68 +294,130 @@ fn login(db: &SharedDb, email: &str, password: &str) -> Result<(String, String),
 }
 
 const DISCORD_NOT_SET_UP: &str = "login with Discord is not set up on this server";
+/// How long a Discord login may take from start to finish, in seconds.
+const DISCORD_WAIT_SECS: u64 = 10 * 60;
 
-/// Starts a Discord login. The state is random and goes back to the client with the code, so the
-/// client can tell the callback belongs to the login it started.
-fn discord_start(redirect_uri: &str) -> AuthReply {
+/// A Discord login (or link) that has started and not finished yet.
+pub struct PendingLogin {
+    /// The session of the account that is linking Discord, or None for a login.
+    link: Option<String>,
+    created: u64,
+    /// The code Discord sent, or why it failed. None until the browser comes back.
+    outcome: Option<Result<String, String>>,
+}
+
+/// Pending Discord logins, by their state.
+pub type PendingLogins = Arc<Mutex<HashMap<String, PendingLogin>>>;
+
+/// Forgets logins that have been waiting too long.
+fn drop_stale(pending: &mut HashMap<String, PendingLogin>, now: u64) {
+    pending.retain(|_, login| now < login.created + DISCORD_WAIT_SECS);
+}
+
+/// Starts a Discord login. With a session token, the Discord account will be linked to that account.
+fn discord_start(db: &SharedDb, pending: &PendingLogins, token: &str) -> AuthReply {
     let Some(config) = discord::config() else {
         return AuthReply::Error { text: DISCORD_NOT_SET_UP.into() };
     };
-    if let Err(text) = discord::check_redirect(redirect_uri) {
-        return AuthReply::Error { text };
-    }
-    let state = new_token();
-    match discord::authorize_url(&config, redirect_uri, &state) {
-        Ok(url) => AuthReply::DiscordUrl { url, state },
-        Err(text) => AuthReply::Error { text },
-    }
-}
-
-/// The Discord account linked to the session's account, and whether the link can be removed.
-fn linked_accounts(db: &SharedDb, token: &str) -> AuthReply {
-    let guard = db.lock().unwrap();
-    let account = match guard.session_account(token) {
-        Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
-        Err(e) => return AuthReply::Error { text: e.to_string() },
-    };
-    match guard.linked_discord_label(&account.id) {
-        Ok(label) => AuthReply::LinkedAccounts {
-            // Links made before names were stored have an empty label.
-            discord: label.map(|name| if name.is_empty() { "a Discord account".to_string() } else { name }),
-            // An account made by Discord has no password. Unlinking would leave it with no way to log in.
-            can_unlink_discord: !account.password_hash.is_empty(),
-        },
-        Err(e) => AuthReply::Error { text: e.to_string() },
-    }
-}
-
-/// Removes the Discord link of the session's account, if it has a password to log in with.
-fn unlink_discord(db: &SharedDb, token: &str) -> AuthReply {
-    let guard = db.lock().unwrap();
-    let account = match guard.session_account(token) {
-        Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
-        Err(e) => return AuthReply::Error { text: e.to_string() },
-    };
-    if account.password_hash.is_empty() {
-        return AuthReply::Error {
-            text: "this account signs in with Discord only, so its Discord link cannot be removed".into(),
+    let link = if token.is_empty() {
+        None
+    } else {
+        let guard = db.lock().unwrap();
+        let account = match guard.session_account(token) {
+            Ok(Some(account)) => account,
+            Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+            Err(e) => return AuthReply::Error { text: e.to_string() },
         };
-    }
-    match guard.unlink_discord(&account.id) {
-        Ok(()) => AuthReply::DiscordUnlinked,
-        Err(e) => AuthReply::Error { text: e.to_string() },
+        match guard.linked_discord_label(&account.id) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return AuthReply::Error { text: "this account already has a Discord account linked. Unlink it first.".into() }
+            }
+            Err(e) => return AuthReply::Error { text: e.to_string() },
+        }
+        Some(token.to_string())
+    };
+    // The state is random. It ties the browser's return to this login.
+    let state = new_token();
+    let url = match discord::authorize_url(&config, &state) {
+        Ok(url) => url,
+        Err(text) => return AuthReply::Error { text },
+    };
+    let now = now_secs();
+    let mut logins = pending.lock().unwrap();
+    drop_stale(&mut logins, now);
+    logins.insert(state.clone(), PendingLogin { link, created: now, outcome: None });
+    AuthReply::DiscordUrl { url, state }
+}
+
+/// Checks a Discord login. Once the browser has come back, this finishes it: a login gives a session,
+/// and a link adds the Discord account to the account that started it.
+async fn discord_poll(db: &SharedDb, pending: &PendingLogins, state: &str) -> AuthReply {
+    let finished = {
+        let mut logins = pending.lock().unwrap();
+        drop_stale(&mut logins, now_secs());
+        let Some(done) = logins.get(state).map(|login| login.outcome.is_some()) else {
+            return AuthReply::Error { text: "this Discord login has expired, start again".into() };
+        };
+        if !done {
+            return AuthReply::DiscordPending;
+        }
+        logins.remove(state).expect("checked above")
+    };
+    let code = match finished.outcome {
+        Some(Ok(code)) => code,
+        Some(Err(text)) => return AuthReply::Error { text },
+        None => return AuthReply::DiscordPending,
+    };
+    let Some(config) = discord::config() else {
+        return AuthReply::Error { text: DISCORD_NOT_SET_UP.into() };
+    };
+    let user = match discord::fetch_user(&config, &code).await {
+        Ok(user) => user,
+        Err(text) => return AuthReply::Error { text },
+    };
+    match finished.link {
+        Some(token) => link_discord_account(db, &token, &user),
+        None => match finish_discord(db, &user) {
+            Ok((token, name)) => AuthReply::Session { token, name },
+            Err(text) => AuthReply::Error { text },
+        },
     }
 }
 
-/// Trades the Discord code for the account's details, then logs in. Returns `(token, name)`.
-async fn discord_login(db: &SharedDb, code: &str, redirect_uri: &str) -> Result<(String, String), String> {
-    let config = discord::config().ok_or_else(|| DISCORD_NOT_SET_UP.to_string())?;
-    discord::check_redirect(redirect_uri)?;
-    let user = discord::fetch_user(&config, code, redirect_uri).await?;
-    // No lock is held across the network calls above; only the database work below uses it.
-    finish_discord(db, &user)
+/// Records the Discord account for the session's account. An account can have one Discord account.
+fn link_discord_account(db: &SharedDb, token: &str, user: &discord::DiscordUser) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    let fail = |e: rusqlite::Error| AuthReply::Error { text: e.to_string() };
+    let owner = match guard.discord_account(&user.id) {
+        Ok(owner) => owner,
+        Err(e) => return fail(e),
+    };
+    if owner.as_deref().is_some_and(|other| other != account.id) {
+        return AuthReply::Error { text: "that Discord account is linked to another Vaxelium account".into() };
+    }
+    let has_link = match guard.linked_discord_label(&account.id) {
+        Ok(label) => label.is_some(),
+        Err(e) => return fail(e),
+    };
+    if has_link && owner.as_deref() != Some(account.id.as_str()) {
+        return AuthReply::Error { text: "this account already has a Discord account linked. Unlink it first.".into() };
+    }
+    let label = discord_label(user);
+    match guard.link_discord(&user.id, &account.id, &label) {
+        Ok(()) => AuthReply::DiscordLinked { discord: label },
+        Err(e) => fail(e),
+    }
+}
+
+/// The name a Discord account is shown with: its display name, or its username.
+fn discord_label(user: &discord::DiscordUser) -> String {
+    user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username).to_string()
 }
 
 /// Finds or makes the account for a Discord user. The rules, in order:
@@ -360,7 +430,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         (Some(email), Some(true)) => normalize_email(email),
         _ => return Err("your Discord email address has to be confirmed to log in with Discord".into()),
     };
-    let label = user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username).to_string();
+    let label = discord_label(user);
     let guard = db.lock().unwrap();
     let token = new_token();
     let now = now_secs();
@@ -384,8 +454,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         return Ok((token, name));
     }
 
-    let name_base = user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username);
-    let name = free_name(&guard, name_base).map_err(map)?;
+    let name = free_name(&guard, &label).map_err(map)?;
     let base = db::username_from(&name);
     let mut username = base.clone();
     let mut n = 2;
@@ -418,6 +487,191 @@ fn free_name(guard: &db::Db, base: &str) -> rusqlite::Result<String> {
     Ok(name)
 }
 
+/// Serves the Discord redirect. It only stores what Discord sent, for the poll to pick up.
+async fn serve_discord_callbacks(addr: String, pending: PendingLogins) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&addr).await?;
+    println!("Discord callbacks on {addr}{}", discord::CALLBACK_PATH);
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let pending = pending.clone();
+        tokio::spawn(async move {
+            if let Err(e) = answer_discord_callback(socket, &pending).await {
+                eprintln!("Discord callback: {e}");
+            }
+        });
+    }
+}
+
+/// Answers one request to the callback with a short page, and keeps what Discord sent.
+async fn answer_discord_callback(socket: TcpStream, pending: &PendingLogins) -> std::io::Result<()> {
+    let (reader, mut writer) = socket.into_split();
+    let mut line = String::new();
+    BufReader::new(reader).read_line(&mut line).await?;
+    let (status, page) = match discord::parse_callback(&line) {
+        discord::Callback::Other => ("404 Not Found", callback_page(false, "Page not found", "There is nothing here.")),
+        discord::Callback::Broken => (
+            "400 Bad Request",
+            callback_page(false, "This link is incomplete", "Start the login again in Vaxelium."),
+        ),
+        discord::Callback::Code { state, code } => {
+            if store_outcome(pending, &state, Ok(code)) {
+                ("200 OK", callback_page(true, "You are logged in", "You can close this tab and return to Vaxelium."))
+            } else {
+                ("200 OK", callback_page(false, "This login has expired", "Start it again in Vaxelium."))
+            }
+        }
+        discord::Callback::Failed { state, text } => {
+            store_outcome(pending, &state, Err(text));
+            (
+                "200 OK",
+                callback_page(false, "The Discord login did not finish", "You can close this tab and try again in Vaxelium."),
+            )
+        }
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    writer.write_all(response.as_bytes()).await?;
+    writer.shutdown().await
+}
+
+/// The page shown in the browser after Discord comes back. The text is fixed, so it needs no escaping.
+fn callback_page(ok: bool, heading: &str, message: &str) -> String {
+    let (icon, colour) = if ok { ("&#10003;", "#23a55a") } else { ("&#10005;", "#f23f43") };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vaxelium · {heading}</title>
+<style>
+  /* Dark, to match the app's default theme. */
+  :root {{ --bg: #1e1f22; --card: #2b2d31; --text: #f2f3f5; --muted: #b5bac1; --border: #3f4147; }}
+  body {{ margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+          padding: 16px; box-sizing: border-box; background: var(--bg); color: var(--text);
+          font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
+  .card {{ width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--border);
+           border-radius: 12px; padding: 32px 28px; text-align: center; box-sizing: border-box; }}
+  .brand {{ font-weight: 700; font-size: 15px; letter-spacing: .04em; color: var(--muted); margin-bottom: 20px; }}
+  .icon {{ width: 56px; height: 56px; margin: 0 auto 18px; border-radius: 50%; background: {colour};
+           color: #ffffff; font-size: 28px; line-height: 56px; font-weight: 700; }}
+  h1 {{ font-size: 22px; margin: 0 0 8px; }}
+  p {{ margin: 0; font-size: 15px; line-height: 1.5; color: var(--muted); }}
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand">VAXELIUM</div>
+    <div class="icon" aria-hidden="true">{icon}</div>
+    <h1>{heading}</h1>
+    <p>{message}</p>
+  </main>
+</body>
+</html>"#
+    )
+}
+
+/// Records what Discord sent for a login that is waiting. False when no such login is waiting.
+fn store_outcome(pending: &PendingLogins, state: &str, outcome: Result<String, String>) -> bool {
+    let mut logins = pending.lock().unwrap();
+    match logins.get_mut(state) {
+        Some(login) if login.outcome.is_none() => {
+            login.outcome = Some(outcome);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Sets a password on an account that has none, such as one made with Discord.
+fn set_password(db: &SharedDb, token: &str, password: &str) -> AuthReply {
+    let len = password.chars().count();
+    if len < MIN_PASSWORD_LEN {
+        return AuthReply::Error { text: format!("password must be at least {MIN_PASSWORD_LEN} characters") };
+    }
+    if len > MAX_PASSWORD_LEN {
+        return AuthReply::Error { text: format!("password must be at most {MAX_PASSWORD_LEN} characters") };
+    }
+    let account = match db.lock().unwrap().session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if !account.password_hash.is_empty() {
+        return AuthReply::Error { text: "this account already has a password".into() };
+    }
+    // Hashing is slow, so it is done without holding the database lock.
+    let hash = match hash_password(password) {
+        Ok(hash) => hash,
+        Err(text) => return AuthReply::Error { text },
+    };
+    match db.lock().unwrap().set_password_hash(&account.email_hash, &hash) {
+        Ok(()) => AuthReply::PasswordSet,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Deletes the session's account, after checking the password. Accounts without a password cannot be
+/// deleted until they set one, because the password is what makes sure it is the owner.
+fn delete_account(db: &SharedDb, token: &str, password: &str) -> AuthReply {
+    let account = match db.lock().unwrap().session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if account.password_hash.is_empty() {
+        return AuthReply::Error { text: "set a password before you delete your account".into() };
+    }
+    if !verify_password(password, &account.password_hash) {
+        return AuthReply::Error { text: "wrong password".into() };
+    }
+    let mut guard = db.lock().unwrap();
+    match guard.delete_account(&account.email_hash) {
+        Ok(()) => AuthReply::AccountDeleted,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// The Discord account linked to the session's account, and whether the link can be removed.
+fn linked_accounts(db: &SharedDb, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match guard.linked_discord_label(&account.id) {
+        Ok(label) => AuthReply::LinkedAccounts {
+            // Links made before names were stored have an empty label.
+            discord: label.map(|name| if name.is_empty() { "a Discord account".to_string() } else { name }),
+            // An account made by Discord has no password. Unlinking would leave it with no way to log in.
+            can_unlink_discord: !account.password_hash.is_empty(),
+        },
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Removes the Discord link of the session's account, if it has a password to log in with.
+fn unlink_discord(db: &SharedDb, token: &str) -> AuthReply {
+    let guard = db.lock().unwrap();
+    let account = match guard.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if account.password_hash.is_empty() {
+        return AuthReply::Error {
+            text: "this account signs in with Discord only. Set a password first, then unlink Discord.".into(),
+        };
+    }
+    match guard.unlink_discord(&account.id) {
+        Ok(()) => AuthReply::DiscordUnlinked,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
 /// The account's name and email, for the session's owner.
 fn profile(db: &SharedDb, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
@@ -434,6 +688,7 @@ fn profile(db: &SharedDb, token: &str) -> AuthReply {
                 bio,
                 banner,
                 avatar,
+                has_password: !account.password_hash.is_empty(),
             }
         }
         Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
@@ -491,6 +746,7 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
         bio,
         banner,
         avatar,
+        has_password: !account.password_hash.is_empty(),
     }
 }
 
@@ -843,6 +1099,39 @@ mod discord_tests {
             linked_accounts(&db, &kai_token),
             AuthReply::LinkedAccounts { discord: None, .. }
         ));
+    }
+
+    #[test]
+    fn a_discord_login_waits_then_reports_what_discord_sent() {
+        let db = shared();
+        let pending: PendingLogins = Arc::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        pending.lock().unwrap().insert("s1".into(), PendingLogin { link: None, created: now_secs(), outcome: None });
+
+        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "s1")), AuthReply::DiscordPending));
+        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "unknown")), AuthReply::Error { .. }));
+
+        assert!(store_outcome(&pending, "s1", Err("The Discord login was cancelled.".into())));
+        assert!(!store_outcome(&pending, "s1", Ok("late".into())), "a login takes one outcome only");
+        match runtime.block_on(discord_poll(&db, &pending, "s1")) {
+            AuthReply::Error { text } => assert!(text.contains("cancelled")),
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "s1")), AuthReply::Error { .. }), "read once, then gone");
+    }
+
+    #[test]
+    fn a_password_must_be_set_before_an_account_can_be_deleted() {
+        let db = shared();
+        let (token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
+        assert!(matches!(delete_account(&db, &token, "anything"), AuthReply::Error { .. }));
+        assert!(matches!(set_password(&db, &token, "short"), AuthReply::Error { .. }));
+        assert!(matches!(set_password(&db, &token, "a long enough password"), AuthReply::PasswordSet));
+        assert!(matches!(set_password(&db, &token, "another password"), AuthReply::Error { .. }), "only once");
+        assert!(matches!(delete_account(&db, &token, "wrong password"), AuthReply::Error { .. }));
+        assert!(matches!(delete_account(&db, &token, "a long enough password"), AuthReply::AccountDeleted));
+        assert!(name_of_session(&db, &token).is_none());
+        assert!(login(&db, "sky@example.com", "a long enough password").is_err());
     }
 
     #[test]
