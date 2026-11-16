@@ -135,7 +135,9 @@ where
             // Talks to Discord over the network, so it runs here rather than in `handle_request`.
             Ok(AuthRequest::DiscordPoll { state }) => discord_poll(&db, &pending, &state).await,
             Ok(request) => handle_request(&db, &pending, request),
-            Err(e) => AuthReply::Error { text: format!("bad request: {e}") },
+            Err(e) => AuthReply::Error {
+                text: format!("bad request: {e}"),
+            },
         };
         let mut out = serde_json::to_string(&reply)?;
         out.push('\n');
@@ -150,8 +152,13 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
         AuthRequest::Login { email, password } => login(db, &email, &password),
         AuthRequest::Verify { token } => {
             return match db.lock().unwrap().session_account(&token) {
-                Ok(Some(account)) => AuthReply::Verified { id: account.id, name: account.name },
-                Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
+                Ok(Some(account)) => AuthReply::Verified {
+                    id: account.id,
+                    name: account.name,
+                },
+                Ok(None) => AuthReply::Error {
+                    text: "your session has expired, log in again".into(),
+                },
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
@@ -176,7 +183,11 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
         AuthRequest::ProfileCard { id, token } => {
             return profile_card(db, &id, &token);
         }
-        AuthRequest::ChangeEmail { token, password, new_email } => {
+        AuthRequest::ChangeEmail {
+            token,
+            password,
+            new_email,
+        } => {
             return change_email(db, &token, &password, &new_email);
         }
         AuthRequest::Logout { token } => {
@@ -188,7 +199,9 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
         AuthRequest::Lookup { name } => {
             return match db.lock().unwrap().account_by_name(&name) {
                 Ok(Some((id, name))) => AuthReply::Account { id, name },
-                Ok(None) => AuthReply::Error { text: format!("there is no account named {name}") },
+                Ok(None) => AuthReply::Error {
+                    text: format!("there is no account named {name}"),
+                },
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
@@ -199,7 +212,9 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
                     Ok(()) => AuthReply::Recorded,
                     Err(e) => AuthReply::Error { text: e.to_string() },
                 },
-                Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
+                Ok(None) => AuthReply::Error {
+                    text: "your session has expired, log in again".into(),
+                },
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
@@ -275,11 +290,7 @@ fn register(db: &SharedDb, name: &str, email: &str, password: &str) -> Result<(S
 fn login(db: &SharedDb, email: &str, password: &str) -> Result<(String, String), String> {
     let email = normalize_email(email);
     // Look the account up, then release the lock before the slow password check.
-    let account = db
-        .lock()
-        .unwrap()
-        .find_account(&email)
-        .map_err(|e| e.to_string())?;
+    let account = db.lock().unwrap().find_account(&email).map_err(|e| e.to_string())?;
     let account = match account {
         Some(acc) if verify_password(password, &acc.password_hash) => acc,
         _ => return Err("wrong email or password".into()),
@@ -317,7 +328,9 @@ fn drop_stale(pending: &mut HashMap<String, PendingLogin>, now: u64) {
 /// Starts a Discord login. With a session token, the Discord account will be linked to that account.
 fn discord_start(db: &SharedDb, pending: &PendingLogins, token: &str) -> AuthReply {
     let Some(config) = discord::config() else {
-        return AuthReply::Error { text: DISCORD_NOT_SET_UP.into() };
+        return AuthReply::Error {
+            text: DISCORD_NOT_SET_UP.into(),
+        };
     };
     let link = if token.is_empty() {
         None
@@ -325,13 +338,19 @@ fn discord_start(db: &SharedDb, pending: &PendingLogins, token: &str) -> AuthRep
         let guard = db.lock().unwrap();
         let account = match guard.session_account(token) {
             Ok(Some(account)) => account,
-            Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+            Ok(None) => {
+                return AuthReply::Error {
+                    text: "your session has expired, log in again".into(),
+                }
+            }
             Err(e) => return AuthReply::Error { text: e.to_string() },
         };
         match guard.linked_discord_label(&account.id) {
             Ok(None) => {}
             Ok(Some(_)) => {
-                return AuthReply::Error { text: "this account already has a Discord account linked. Unlink it first.".into() }
+                return AuthReply::Error {
+                    text: "this account already has a Discord account linked. Unlink it first.".into(),
+                }
             }
             Err(e) => return AuthReply::Error { text: e.to_string() },
         }
@@ -346,7 +365,14 @@ fn discord_start(db: &SharedDb, pending: &PendingLogins, token: &str) -> AuthRep
     let now = now_secs();
     let mut logins = pending.lock().unwrap();
     drop_stale(&mut logins, now);
-    logins.insert(state.clone(), PendingLogin { link, created: now, outcome: None });
+    logins.insert(
+        state.clone(),
+        PendingLogin {
+            link,
+            created: now,
+            outcome: None,
+        },
+    );
     AuthReply::DiscordUrl { url, state }
 }
 
@@ -357,7 +383,9 @@ async fn discord_poll(db: &SharedDb, pending: &PendingLogins, state: &str) -> Au
         let mut logins = pending.lock().unwrap();
         drop_stale(&mut logins, now_secs());
         let Some(done) = logins.get(state).map(|login| login.outcome.is_some()) else {
-            return AuthReply::Error { text: "this Discord login has expired, start again".into() };
+            return AuthReply::Error {
+                text: "this Discord login has expired, start again".into(),
+            };
         };
         if !done {
             return AuthReply::DiscordPending;
@@ -370,7 +398,9 @@ async fn discord_poll(db: &SharedDb, pending: &PendingLogins, state: &str) -> Au
         None => return AuthReply::DiscordPending,
     };
     let Some(config) = discord::config() else {
-        return AuthReply::Error { text: DISCORD_NOT_SET_UP.into() };
+        return AuthReply::Error {
+            text: DISCORD_NOT_SET_UP.into(),
+        };
     };
     let user = match discord::fetch_user(&config, &code).await {
         Ok(user) => user,
@@ -390,7 +420,11 @@ fn link_discord_account(db: &SharedDb, token: &str, user: &discord::DiscordUser)
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     let fail = |e: rusqlite::Error| AuthReply::Error { text: e.to_string() };
@@ -399,14 +433,18 @@ fn link_discord_account(db: &SharedDb, token: &str, user: &discord::DiscordUser)
         Err(e) => return fail(e),
     };
     if owner.as_deref().is_some_and(|other| other != account.id) {
-        return AuthReply::Error { text: "that Discord account is linked to another Vaxelium account".into() };
+        return AuthReply::Error {
+            text: "that Discord account is linked to another Vaxelium account".into(),
+        };
     }
     let has_link = match guard.linked_discord_label(&account.id) {
         Ok(label) => label.is_some(),
         Err(e) => return fail(e),
     };
     if has_link && owner.as_deref() != Some(account.id.as_str()) {
-        return AuthReply::Error { text: "this account already has a Discord account linked. Unlink it first.".into() };
+        return AuthReply::Error {
+            text: "this account already has a Discord account linked. Unlink it first.".into(),
+        };
     }
     let label = discord_label(user);
     match guard.link_discord(&user.id, &account.id, &label) {
@@ -417,7 +455,12 @@ fn link_discord_account(db: &SharedDb, token: &str, user: &discord::DiscordUser)
 
 /// The name a Discord account is shown with: its display name, or its username.
 fn discord_label(user: &discord::DiscordUser) -> String {
-    user.global_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&user.username).to_string()
+    user.global_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&user.username)
+        .to_string()
 }
 
 /// Finds or makes the account for a Discord user. The rules, in order:
@@ -440,7 +483,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         if let Some(name) = guard.name_of_account(&id).map_err(map)? {
             // The Discord name may have changed since the link was made, so it is refreshed.
             guard.link_discord(&user.id, &id, &label).map_err(map)?;
-            guard.create_session_for_account(&token, &id, now).map_err(map)?;
+            guard.create_account_session(&token, &id, now).map_err(map)?;
             return Ok((token, name));
         }
         // The linked account was removed, so the link is made again below.
@@ -450,7 +493,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
             return Err("an account with this email exists but its email is not confirmed. Log in with its password and confirm the email, then try Discord again".into());
         }
         guard.link_discord(&user.id, &id, &label).map_err(map)?;
-        guard.create_session_for_account(&token, &id, now).map_err(map)?;
+        guard.create_account_session(&token, &id, now).map_err(map)?;
         return Ok((token, name));
     }
 
@@ -467,7 +510,7 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
         .map_err(map)?
         .ok_or_else(|| "that name or email is already registered".to_string())?;
     guard.link_discord(&user.id, &id, &label).map_err(map)?;
-    guard.create_session_for_account(&token, &id, now).map_err(map)?;
+    guard.create_account_session(&token, &id, now).map_err(map)?;
     drop(guard);
     mail::send_welcome(name.clone(), email);
     Ok((token, name))
@@ -476,7 +519,11 @@ fn finish_discord(db: &SharedDb, user: &discord::DiscordUser) -> Result<(String,
 /// The name, trimmed and cut to the longest allowed. If another account has it, a number is added.
 fn free_name(guard: &db::Db, base: &str) -> rusqlite::Result<String> {
     let base: String = base.chars().take(MAX_NAME_LEN).collect();
-    let base = if base.trim().is_empty() { "discord user".to_string() } else { base };
+    let base = if base.trim().is_empty() {
+        "discord user".to_string()
+    } else {
+        base
+    };
     let mut name = base.clone();
     let mut n = 2;
     while guard.account_by_name(&name)?.is_some() {
@@ -508,23 +555,40 @@ async fn answer_discord_callback(socket: TcpStream, pending: &PendingLogins) -> 
     let mut line = String::new();
     BufReader::new(reader).read_line(&mut line).await?;
     let (status, page) = match discord::parse_callback(&line) {
-        discord::Callback::Other => ("404 Not Found", callback_page(false, "Page not found", "There is nothing here.")),
+        discord::Callback::Other => (
+            "404 Not Found",
+            callback_page(false, "Page not found", "There is nothing here."),
+        ),
         discord::Callback::Broken => (
             "400 Bad Request",
             callback_page(false, "This link is incomplete", "Start the login again in Vaxelium."),
         ),
         discord::Callback::Code { state, code } => {
             if store_outcome(pending, &state, Ok(code)) {
-                ("200 OK", callback_page(true, "You are logged in", "You can close this tab and return to Vaxelium."))
+                (
+                    "200 OK",
+                    callback_page(
+                        true,
+                        "You are logged in",
+                        "You can close this tab and return to Vaxelium.",
+                    ),
+                )
             } else {
-                ("200 OK", callback_page(false, "This login has expired", "Start it again in Vaxelium."))
+                (
+                    "200 OK",
+                    callback_page(false, "This login has expired", "Start it again in Vaxelium."),
+                )
             }
         }
         discord::Callback::Failed { state, text } => {
             store_outcome(pending, &state, Err(text));
             (
                 "200 OK",
-                callback_page(false, "The Discord login did not finish", "You can close this tab and try again in Vaxelium."),
+                callback_page(
+                    false,
+                    "The Discord login did not finish",
+                    "You can close this tab and try again in Vaxelium.",
+                ),
             )
         }
     };
@@ -538,7 +602,11 @@ async fn answer_discord_callback(socket: TcpStream, pending: &PendingLogins) -> 
 
 /// The page shown in the browser after Discord comes back. The text is fixed, so it needs no escaping.
 fn callback_page(ok: bool, heading: &str, message: &str) -> String {
-    let (icon, colour) = if ok { ("&#10003;", "#23a55a") } else { ("&#10005;", "#f23f43") };
+    let (icon, colour) = if ok {
+        ("&#10003;", "#23a55a")
+    } else {
+        ("&#10005;", "#f23f43")
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -589,18 +657,28 @@ fn store_outcome(pending: &PendingLogins, state: &str, outcome: Result<String, S
 fn set_password(db: &SharedDb, token: &str, password: &str) -> AuthReply {
     let len = password.chars().count();
     if len < MIN_PASSWORD_LEN {
-        return AuthReply::Error { text: format!("password must be at least {MIN_PASSWORD_LEN} characters") };
+        return AuthReply::Error {
+            text: format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+        };
     }
     if len > MAX_PASSWORD_LEN {
-        return AuthReply::Error { text: format!("password must be at most {MAX_PASSWORD_LEN} characters") };
+        return AuthReply::Error {
+            text: format!("password must be at most {MAX_PASSWORD_LEN} characters"),
+        };
     }
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if !account.password_hash.is_empty() {
-        return AuthReply::Error { text: "this account already has a password".into() };
+        return AuthReply::Error {
+            text: "this account already has a password".into(),
+        };
     }
     // Hashing is slow, so it is done without holding the database lock.
     let hash = match hash_password(password) {
@@ -618,14 +696,22 @@ fn set_password(db: &SharedDb, token: &str, password: &str) -> AuthReply {
 fn delete_account(db: &SharedDb, token: &str, password: &str) -> AuthReply {
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if account.password_hash.is_empty() {
-        return AuthReply::Error { text: "set a password before you delete your account".into() };
+        return AuthReply::Error {
+            text: "set a password before you delete your account".into(),
+        };
     }
     if !verify_password(password, &account.password_hash) {
-        return AuthReply::Error { text: "wrong password".into() };
+        return AuthReply::Error {
+            text: "wrong password".into(),
+        };
     }
     let mut guard = db.lock().unwrap();
     match guard.delete_account(&account.email_hash) {
@@ -639,13 +725,23 @@ fn linked_accounts(db: &SharedDb, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     match guard.linked_discord_label(&account.id) {
         Ok(label) => AuthReply::LinkedAccounts {
             // Links made before names were stored have an empty label.
-            discord: label.map(|name| if name.is_empty() { "a Discord account".to_string() } else { name }),
+            discord: label.map(|name| {
+                if name.is_empty() {
+                    "a Discord account".to_string()
+                } else {
+                    name
+                }
+            }),
             // An account made by Discord has no password. Unlinking would leave it with no way to log in.
             can_unlink_discord: !account.password_hash.is_empty(),
         },
@@ -658,7 +754,11 @@ fn unlink_discord(db: &SharedDb, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if account.password_hash.is_empty() {
@@ -691,7 +791,9 @@ fn profile(db: &SharedDb, token: &str) -> AuthReply {
                 has_password: !account.password_hash.is_empty(),
             }
         }
-        Ok(None) => AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => AuthReply::Error {
+            text: "your session has expired, log in again".into(),
+        },
         Err(e) => AuthReply::Error { text: e.to_string() },
     }
 }
@@ -701,25 +803,37 @@ fn profile(db: &SharedDb, token: &str) -> AuthReply {
 fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Option<String>) -> AuthReply {
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     let guard = db.lock().unwrap();
     if let Some(name) = name {
         let name = name.trim().to_string();
         if name.is_empty() || name.chars().count() > MAX_NAME_LEN {
-            return AuthReply::Error { text: format!("name must be 1-{MAX_NAME_LEN} characters") };
+            return AuthReply::Error {
+                text: format!("name must be 1-{MAX_NAME_LEN} characters"),
+            };
         }
         match guard.set_display_name(&account.email_hash, &name) {
             Ok(true) => {}
-            Ok(false) => return AuthReply::Error { text: "that name is already taken".into() },
+            Ok(false) => {
+                return AuthReply::Error {
+                    text: "that name is already taken".into(),
+                }
+            }
             Err(e) => return AuthReply::Error { text: e.to_string() },
         }
     }
     if let Some(username) = username {
         let username = username.trim().to_lowercase();
         let valid = (2..=24).contains(&username.len())
-            && username.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            && username
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
         if !valid {
             return AuthReply::Error {
                 text: "usernames are 2-24 letters, digits or underscores".into(),
@@ -727,13 +841,21 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
         }
         match guard.set_username(&account.email_hash, &username) {
             Ok(true) => {}
-            Ok(false) => return AuthReply::Error { text: "that username is taken".into() },
+            Ok(false) => {
+                return AuthReply::Error {
+                    text: "that username is taken".into(),
+                }
+            }
             Err(e) => return AuthReply::Error { text: e.to_string() },
         }
     }
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        _ => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        _ => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
     };
     let (bio, banner) = guard.about(&account.email_hash).unwrap_or_default();
     let avatar = guard.avatar(&account.email_hash).unwrap_or_default();
@@ -754,12 +876,18 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
 fn set_avatar(db: &SharedDb, token: &str, png_base64: Option<String>) -> AuthReply {
     let avatar = png_base64.unwrap_or_default();
     if avatar.len() > common::MAX_AVATAR_LEN {
-        return AuthReply::Error { text: "that picture is too large".into() };
+        return AuthReply::Error {
+            text: "that picture is too large".into(),
+        };
     }
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     match guard.set_avatar(&account.email_hash, &avatar) {
@@ -773,16 +901,25 @@ fn set_about(db: &SharedDb, token: &str, bio: String, banner: String) -> AuthRep
     let bio = bio.trim().to_string();
     let banner = banner.trim().to_string();
     if bio.chars().count() > 190 {
-        return AuthReply::Error { text: "the bio can be at most 190 characters".into() };
+        return AuthReply::Error {
+            text: "the bio can be at most 190 characters".into(),
+        };
     }
-    let banner_ok = banner.is_empty() || (banner.len() == 7 && banner.starts_with('#') && banner[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+    let banner_ok = banner.is_empty()
+        || (banner.len() == 7 && banner.starts_with('#') && banner[1..].bytes().all(|b| b.is_ascii_hexdigit()));
     if !banner_ok {
-        return AuthReply::Error { text: "the banner colour must look like #rrggbb".into() };
+        return AuthReply::Error {
+            text: "the banner colour must look like #rrggbb".into(),
+        };
     }
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     match guard.set_about(&account.email_hash, &bio, &banner) {
@@ -808,7 +945,11 @@ fn set_servers(db: &SharedDb, token: &str, servers: Vec<String>) -> AuthReply {
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     match guard.set_servers(&account.email_hash, &clean.join("\n")) {
@@ -822,7 +963,11 @@ fn profile_card(db: &SharedDb, id: &str, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     let card = match guard.profile_card(id) {
         Ok(Some(card)) => card,
-        Ok(None) => return AuthReply::Error { text: "there is no such account".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "there is no such account".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     let (name, username, bio, banner, avatar, created, status) = card;
@@ -835,23 +980,42 @@ fn profile_card(db: &SharedDb, id: &str, token: &str) -> AuthReply {
                 let viewer_servers = guard.servers_for_email(&viewer.email_hash).unwrap_or_default();
                 // The viewer's order, kept, for the servers both lists have.
                 let theirs: Vec<&str> = theirs.lines().collect();
-                viewer_servers.lines().filter(|s| theirs.contains(s)).map(String::from).collect()
+                viewer_servers
+                    .lines()
+                    .filter(|s| theirs.contains(s))
+                    .map(String::from)
+                    .collect()
             }
             _ => Vec::new(),
         }
     };
-    AuthReply::ProfileCard { name, username, bio, banner, avatar, created, status, mutual }
+    AuthReply::ProfileCard {
+        name,
+        username,
+        bio,
+        banner,
+        avatar,
+        created,
+        status,
+        mutual,
+    }
 }
 
 fn set_status_text(db: &SharedDb, token: &str, text: String) -> AuthReply {
     let text = text.trim().to_string();
     if text.chars().count() > common::MAX_STATUS_TEXT_LEN {
-        return AuthReply::Error { text: format!("the status can be at most {} characters", common::MAX_STATUS_TEXT_LEN) };
+        return AuthReply::Error {
+            text: format!("the status can be at most {} characters", common::MAX_STATUS_TEXT_LEN),
+        };
     }
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     match guard.set_status_text(&account.email_hash, &text) {
@@ -864,21 +1028,31 @@ fn set_status_text(db: &SharedDb, token: &str, text: String) -> AuthReply {
 fn change_email(db: &SharedDb, token: &str, password: &str, new_email: &str) -> AuthReply {
     let new_email = normalize_email(new_email);
     if !is_valid_email(&new_email) {
-        return AuthReply::Error { text: "enter a valid email address".into() };
+        return AuthReply::Error {
+            text: "enter a valid email address".into(),
+        };
     }
     // Read the account, then release the lock before the slow password check.
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if !verify_password(password, &account.password_hash) {
-        return AuthReply::Error { text: "wrong password".into() };
+        return AuthReply::Error {
+            text: "wrong password".into(),
+        };
     }
     let mut guard = db.lock().unwrap();
     match guard.change_email(&account.email_hash, &new_email) {
         Ok(true) => AuthReply::EmailChanged { email: new_email },
-        Ok(false) => AuthReply::Error { text: "that email is already registered".into() },
+        Ok(false) => AuthReply::Error {
+            text: "that email is already registered".into(),
+        },
         Err(e) => AuthReply::Error { text: e.to_string() },
     }
 }
@@ -894,7 +1068,10 @@ const CODE_WAIT_SECS: u64 = 60;
 /// different hash for each account.
 fn code_hash(email_hash: &str, code: &str) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(format!("{email_hash}:{code}").as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(format!("{email_hash}:{code}").as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Emails a new six-digit code to the account's address.
@@ -902,26 +1079,43 @@ fn request_email_code(db: &SharedDb, token: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if guard.is_verified(&account.email_hash).unwrap_or(false) {
-        return AuthReply::Error { text: "your email is already confirmed".into() };
+        return AuthReply::Error {
+            text: "your email is already confirmed".into(),
+        };
     }
     let Some(email) = guard.account_email(&account) else {
-        return AuthReply::Error { text: "this account has no email address on record".into() };
+        return AuthReply::Error {
+            text: "this account has no email address on record".into(),
+        };
     };
     if !mail::configured() {
-        return AuthReply::Error { text: "email sending is not set up on this server".into() };
+        return AuthReply::Error {
+            text: "email sending is not set up on this server".into(),
+        };
     }
     let now = now_secs();
     if let Ok(Some((_, _, _, sent))) = guard.pending_code(&account.email_hash) {
         if now < sent + CODE_WAIT_SECS {
-            return AuthReply::Error { text: "wait a minute before asking for another code".into() };
+            return AuthReply::Error {
+                text: "wait a minute before asking for another code".into(),
+            };
         }
     }
     let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
-    if let Err(e) = guard.store_code(&account.email_hash, &code_hash(&account.email_hash, &code), now + CODE_SECS, now) {
+    if let Err(e) = guard.store_code(
+        &account.email_hash,
+        &code_hash(&account.email_hash, &code),
+        now + CODE_SECS,
+        now,
+    ) {
         return AuthReply::Error { text: e.to_string() };
     }
     drop(guard);
@@ -934,24 +1128,38 @@ fn verify_email(db: &SharedDb, token: &str, code: &str) -> AuthReply {
     let guard = db.lock().unwrap();
     let account = match guard.session_account(token) {
         Ok(Some(account)) => account,
-        Ok(None) => return AuthReply::Error { text: "your session has expired, log in again".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     let (stored, expires, tries, _) = match guard.pending_code(&account.email_hash) {
         Ok(Some(pending)) => pending,
-        Ok(None) => return AuthReply::Error { text: "ask for a code first".into() },
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "ask for a code first".into(),
+            }
+        }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
     if now_secs() > expires {
         let _ = guard.clear_code(&account.email_hash);
-        return AuthReply::Error { text: "that code has expired, ask for a new one".into() };
+        return AuthReply::Error {
+            text: "that code has expired, ask for a new one".into(),
+        };
     }
     if tries >= MAX_CODE_TRIES {
-        return AuthReply::Error { text: "too many wrong codes, ask for a new one".into() };
+        return AuthReply::Error {
+            text: "too many wrong codes, ask for a new one".into(),
+        };
     }
     if code_hash(&account.email_hash, code.trim()) != stored {
         let _ = guard.count_wrong_code(&account.email_hash);
-        return AuthReply::Error { text: "that code is wrong".into() };
+        return AuthReply::Error {
+            text: "that code is wrong".into(),
+        };
     }
     let _ = guard.set_verified(&account.email_hash, true);
     let _ = guard.clear_code(&account.email_hash);
@@ -972,9 +1180,7 @@ fn hash_password(password: &str) -> Result<String, String> {
 
 fn verify_password(password: &str, stored_hash: &str) -> bool {
     match PasswordHash::new(stored_hash) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
+        Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
         Err(_) => false,
     }
 }
@@ -993,152 +1199,5 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
-mod discord_tests {
-    use super::*;
-    use discord::DiscordUser;
-
-    const KEY: [u8; 32] = [3; 32];
-
-    fn shared() -> SharedDb {
-        Arc::new(Mutex::new(Db::open(":memory:", KEY).unwrap()))
-    }
-
-    fn discord_user(id: &str, name: &str, email: Option<&str>, verified: Option<bool>) -> DiscordUser {
-        DiscordUser {
-            id: id.into(),
-            username: name.to_lowercase(),
-            global_name: Some(name.into()),
-            email: email.map(String::from),
-            verified,
-        }
-    }
-
-    fn name_of_session(db: &SharedDb, token: &str) -> Option<String> {
-        db.lock().unwrap().session_account(token).unwrap().map(|a| a.name)
-    }
-
-    #[test]
-    fn a_new_discord_user_gets_an_account_that_logs_in_again() {
-        let db = shared();
-        let (token, name) = finish_discord(&db, &discord_user("111", "Sky", Some("Sky@Example.com"), Some(true))).unwrap();
-        assert_eq!(name, "Sky");
-        assert_eq!(name_of_session(&db, &token).as_deref(), Some("Sky"));
-
-        // Discord's name has changed since, but the same Discord account finds the same account.
-        let (_, again) = finish_discord(&db, &discord_user("111", "Sky Renamed", Some("sky@example.com"), Some(true))).unwrap();
-        assert_eq!(again, "Sky");
-    }
-
-    #[test]
-    fn a_discord_account_has_no_password_so_password_login_cannot_reach_it() {
-        let db = shared();
-        finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
-        assert!(login(&db, "sky@example.com", "any password at all").is_err());
-    }
-
-    #[test]
-    fn a_discord_email_that_is_not_confirmed_by_discord_is_refused() {
-        let db = shared();
-        assert!(finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(false))).is_err());
-        assert!(finish_discord(&db, &discord_user("111", "Sky", None, Some(true))).is_err());
-        assert!(finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), None)).is_err());
-    }
-
-    #[test]
-    fn a_confirmed_account_with_the_same_email_is_linked() {
-        let db = shared();
-        {
-            let guard = db.lock().unwrap();
-            assert!(guard.create_account("Kai", "kai", "kai@example.com", "some-hash", 1).unwrap());
-            guard.set_verified(&db::hash_email(&KEY, "kai@example.com"), true).unwrap();
-        }
-        let (token, name) = finish_discord(&db, &discord_user("222", "Kai on Discord", Some("kai@example.com"), Some(true))).unwrap();
-        assert_eq!(name, "Kai", "logs in to the existing account");
-        assert_eq!(name_of_session(&db, &token).as_deref(), Some("Kai"));
-        // Linked now, so the next Discord login does not need the email again.
-        assert!(db.lock().unwrap().discord_account("222").unwrap().is_some());
-    }
-
-    #[test]
-    fn an_unconfirmed_account_with_the_same_email_is_not_taken_over() {
-        let db = shared();
-        db.lock().unwrap().create_account("Ivy", "ivy", "ivy@example.com", "some-hash", 1).unwrap();
-        let err = finish_discord(&db, &discord_user("333", "Ivy", Some("ivy@example.com"), Some(true))).unwrap_err();
-        assert!(err.contains("not confirmed"), "{err}");
-        assert!(db.lock().unwrap().discord_account("333").unwrap().is_none(), "no link was made");
-    }
-
-    #[test]
-    fn a_discord_only_account_cannot_unlink_discord_but_a_password_account_can() {
-        let db = shared();
-        let (discord_token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
-        match linked_accounts(&db, &discord_token) {
-            AuthReply::LinkedAccounts { discord, can_unlink_discord } => {
-                assert_eq!(discord.as_deref(), Some("Sky"));
-                assert!(!can_unlink_discord, "a Discord-only account has no password to fall back on");
-            }
-            other => panic!("unexpected reply {other:?}"),
-        }
-        assert!(matches!(unlink_discord(&db, &discord_token), AuthReply::Error { .. }));
-
-        let (kai_token, _) = register(&db, "Kai", "kai@example.com", "a password here").unwrap();
-        {
-            let guard = db.lock().unwrap();
-            let id = guard.session_account(&kai_token).unwrap().unwrap().id;
-            guard.link_discord("222", &id, "Kai on Discord").unwrap();
-        }
-        match linked_accounts(&db, &kai_token) {
-            AuthReply::LinkedAccounts { discord, can_unlink_discord } => {
-                assert_eq!(discord.as_deref(), Some("Kai on Discord"));
-                assert!(can_unlink_discord);
-            }
-            other => panic!("unexpected reply {other:?}"),
-        }
-        assert!(matches!(unlink_discord(&db, &kai_token), AuthReply::DiscordUnlinked));
-        assert!(matches!(
-            linked_accounts(&db, &kai_token),
-            AuthReply::LinkedAccounts { discord: None, .. }
-        ));
-    }
-
-    #[test]
-    fn a_discord_login_waits_then_reports_what_discord_sent() {
-        let db = shared();
-        let pending: PendingLogins = Arc::default();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        pending.lock().unwrap().insert("s1".into(), PendingLogin { link: None, created: now_secs(), outcome: None });
-
-        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "s1")), AuthReply::DiscordPending));
-        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "unknown")), AuthReply::Error { .. }));
-
-        assert!(store_outcome(&pending, "s1", Err("The Discord login was cancelled.".into())));
-        assert!(!store_outcome(&pending, "s1", Ok("late".into())), "a login takes one outcome only");
-        match runtime.block_on(discord_poll(&db, &pending, "s1")) {
-            AuthReply::Error { text } => assert!(text.contains("cancelled")),
-            other => panic!("unexpected reply {other:?}"),
-        }
-        assert!(matches!(runtime.block_on(discord_poll(&db, &pending, "s1")), AuthReply::Error { .. }), "read once, then gone");
-    }
-
-    #[test]
-    fn a_password_must_be_set_before_an_account_can_be_deleted() {
-        let db = shared();
-        let (token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
-        assert!(matches!(delete_account(&db, &token, "anything"), AuthReply::Error { .. }));
-        assert!(matches!(set_password(&db, &token, "short"), AuthReply::Error { .. }));
-        assert!(matches!(set_password(&db, &token, "a long enough password"), AuthReply::PasswordSet));
-        assert!(matches!(set_password(&db, &token, "another password"), AuthReply::Error { .. }), "only once");
-        assert!(matches!(delete_account(&db, &token, "wrong password"), AuthReply::Error { .. }));
-        assert!(matches!(delete_account(&db, &token, "a long enough password"), AuthReply::AccountDeleted));
-        assert!(name_of_session(&db, &token).is_none());
-        assert!(login(&db, "sky@example.com", "a long enough password").is_err());
-    }
-
-    #[test]
-    fn a_taken_display_name_gets_a_number() {
-        let db = shared();
-        finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
-        let (_, name) = finish_discord(&db, &discord_user("444", "Sky", Some("other@example.com"), Some(true))).unwrap();
-        assert_eq!(name, "Sky 2");
-    }
-}
+#[path = "tests/main.rs"]
+mod tests;

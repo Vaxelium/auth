@@ -68,7 +68,11 @@ pub fn username_from(name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(20)
         .collect();
-    if cleaned.len() < 2 { format!("user_{cleaned}") } else { cleaned }
+    if cleaned.len() < 2 {
+        format!("user_{cleaned}")
+    } else {
+        cleaned
+    }
 }
 
 /// `Ok(true)` when the statement ran, `Ok(false)` when it broke a uniqueness rule.
@@ -122,19 +126,28 @@ impl Db {
         // Databases made before emails could be shown lack this column.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN email_enc TEXT", []);
         // Accounts made before email confirmation lack this column; they start unconfirmed.
-        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN verified INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE accounts ADD COLUMN verified INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Accounts made before ids and usernames existed. An account's id starts as its name,
         // so the messages it wrote still belong to it. Its username is its name in lowercase.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN id TEXT", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN username TEXT", []);
         // Profile cards: a short bio and a banner colour. Accounts made before them lack the columns.
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN status_text TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE accounts ADD COLUMN status_text TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN servers TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN banner TEXT NOT NULL DEFAULT ''", []);
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT ''", []);
         // The Discord name shown in the account's settings. Links made before it existed have none.
-        let _ = conn.execute("ALTER TABLE discord_links ADD COLUMN label TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE discord_links ADD COLUMN label TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         conn.execute("UPDATE accounts SET id = name WHERE id IS NULL", [])?;
         let mut db = Self { conn, key };
         db.fill_usernames()?;
@@ -150,9 +163,9 @@ impl Db {
     /// change is recorded, so chat servers can follow it. Accounts already migrated are left alone.
     fn migrate_legacy_ids(&mut self) -> rusqlite::Result<usize> {
         let legacy: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM accounts WHERE length(id) != 32 OR id GLOB '*[^0-9a-f]*'",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM accounts WHERE length(id) != 32 OR id GLOB '*[^0-9a-f]*'")?;
             let ids = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
             ids
         };
@@ -160,8 +173,14 @@ impl Db {
         for old in &legacy {
             let new = hex(&rand::random::<[u8; 16]>());
             tx.execute("UPDATE accounts SET id = ?2 WHERE id = ?1", params![old, new])?;
-            tx.execute("UPDATE locations SET account = ?2 WHERE account = ?1", params![old, new])?;
-            tx.execute("INSERT OR REPLACE INTO id_migrations (old, new) VALUES (?1, ?2)", params![old, new])?;
+            tx.execute(
+                "UPDATE locations SET account = ?2 WHERE account = ?1",
+                params![old, new],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO id_migrations (old, new) VALUES (?1, ?2)",
+                params![old, new],
+            )?;
         }
         tx.commit()?;
         if !legacy.is_empty() {
@@ -177,7 +196,9 @@ impl Db {
             use rusqlite::OptionalExtension;
             if let Some(new) = self
                 .conn
-                .query_row("SELECT new FROM id_migrations WHERE old = ?1", params![old], |row| row.get::<_, String>(0))
+                .query_row("SELECT new FROM id_migrations WHERE old = ?1", params![old], |row| {
+                    row.get::<_, String>(0)
+                })
                 .optional()?
             {
                 out.push((old.clone(), new));
@@ -190,7 +211,9 @@ impl Db {
     /// username already, a number is added.
     fn fill_usernames(&mut self) -> rusqlite::Result<()> {
         let missing: Vec<(String, String)> = {
-            let mut stmt = self.conn.prepare("SELECT email, name FROM accounts WHERE username IS NULL")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT email, name FROM accounts WHERE username IS NULL")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -240,7 +263,10 @@ impl Db {
     /// Sets the status text of the account with this (hashed) email.
     /// Saves the servers (addresses, one per line) that the account with this (hashed) email is in.
     pub fn set_servers(&self, email_hash: &str, servers: &str) -> rusqlite::Result<()> {
-        self.conn.execute("UPDATE accounts SET servers = ?2 WHERE email = ?1", params![email_hash, servers])?;
+        self.conn.execute(
+            "UPDATE accounts SET servers = ?2 WHERE email = ?1",
+            params![email_hash, servers],
+        )?;
         Ok(())
     }
 
@@ -248,7 +274,11 @@ impl Db {
     pub fn servers_for_email(&self, email_hash: &str) -> rusqlite::Result<String> {
         Ok(self
             .conn
-            .query_row("SELECT COALESCE(servers, '') FROM accounts WHERE email = ?1", params![email_hash], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(servers, '') FROM accounts WHERE email = ?1",
+                params![email_hash],
+                |row| row.get(0),
+            )
             .optional()?
             .unwrap_or_default())
     }
@@ -257,13 +287,20 @@ impl Db {
     pub fn servers_for_id(&self, id: &str) -> rusqlite::Result<String> {
         Ok(self
             .conn
-            .query_row("SELECT COALESCE(servers, '') FROM accounts WHERE id = ?1", params![id], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(servers, '') FROM accounts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
             .optional()?
             .unwrap_or_default())
     }
 
     pub fn set_status_text(&self, email_hash: &str, text: &str) -> rusqlite::Result<()> {
-        self.conn.execute("UPDATE accounts SET status_text = ?2 WHERE email = ?1", params![email_hash, text])?;
+        self.conn.execute(
+            "UPDATE accounts SET status_text = ?2 WHERE email = ?1",
+            params![email_hash, text],
+        )?;
         Ok(())
     }
 
@@ -287,12 +324,18 @@ impl Db {
 
     /// Sets the profile picture of the account with this (hashed) email.
     pub fn set_avatar(&self, email_hash: &str, avatar: &str) -> rusqlite::Result<()> {
-        self.conn.execute("UPDATE accounts SET avatar = ?2 WHERE email = ?1", params![email_hash, avatar])?;
+        self.conn.execute(
+            "UPDATE accounts SET avatar = ?2 WHERE email = ?1",
+            params![email_hash, avatar],
+        )?;
         Ok(())
     }
 
     /// The public card of the account with this id: name, username, bio, banner colour and picture.
-    pub fn profile_card(&self, id: &str) -> rusqlite::Result<Option<(String, String, String, String, String, u64, String)>> {
+    pub fn profile_card(
+        &self,
+        id: &str,
+    ) -> rusqlite::Result<Option<(String, String, String, String, String, u64, String)>> {
         self.conn
             .query_row(
                 "SELECT name, COALESCE(username, ''), COALESCE(bio, ''), COALESCE(banner, ''), COALESCE(avatar, ''), created, COALESCE(status_text, '') FROM accounts WHERE id = ?1",
@@ -324,8 +367,14 @@ impl Db {
         let tx = self.conn.transaction()?;
         for email in &plain {
             let hashed = hash_email(&self.key, email);
-            tx.execute("UPDATE accounts SET email = ?1 WHERE email = ?2", params![hashed, email])?;
-            tx.execute("UPDATE sessions SET email = ?1 WHERE email = ?2", params![hashed, email])?;
+            tx.execute(
+                "UPDATE accounts SET email = ?1 WHERE email = ?2",
+                params![hashed, email],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET email = ?1 WHERE email = ?2",
+                params![hashed, email],
+            )?;
         }
         tx.commit()?;
         Ok(plain.len())
@@ -333,11 +382,10 @@ impl Db {
 
     /// Accounts whose email is already hashed. These need the key file to log in.
     pub fn hashed_account_count(&self) -> rusqlite::Result<i64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM accounts WHERE instr(email, '@') = 0",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row("SELECT COUNT(*) FROM accounts WHERE instr(email, '@') = 0", [], |row| {
+                row.get(0)
+            })
     }
 
     pub fn find_account(&self, email: &str) -> rusqlite::Result<Option<Account>> {
@@ -385,11 +433,9 @@ impl Db {
     /// The account with this display name, as `(id, name)`.
     pub fn account_by_name(&self, name: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
-            .query_row(
-                "SELECT id, name FROM accounts WHERE name = ?1",
-                params![name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row("SELECT id, name FROM accounts WHERE name = ?1", params![name], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()
     }
 
@@ -405,9 +451,9 @@ impl Db {
 
     /// The servers an account was last seen at, most recent first.
     pub fn locations_of(&self, account: &str) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT addr FROM locations WHERE account = ?1 ORDER BY seen DESC LIMIT 5",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT addr FROM locations WHERE account = ?1 ORDER BY seen DESC LIMIT 5")?;
         let rows = stmt.query_map(params![account], |row| row.get(0))?;
         rows.collect()
     }
@@ -442,7 +488,9 @@ impl Db {
         let nonce = unhex(nonce_hex)?;
         let cipher = unhex(cipher_hex)?;
         let key = chacha20poly1305::Key::from_slice(&self.key);
-        let plain = ChaCha20Poly1305::new(key).decrypt(Nonce::from_slice(&nonce), cipher.as_slice()).ok()?;
+        let plain = ChaCha20Poly1305::new(key)
+            .decrypt(Nonce::from_slice(&nonce), cipher.as_slice())
+            .ok()?;
         String::from_utf8(plain).ok()
     }
 
@@ -497,7 +545,14 @@ impl Db {
             .query_row(
                 "SELECT code_hash, expires, attempts, sent FROM email_codes WHERE email_hash = ?1",
                 params![email_hash],
-                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u32, row.get::<_, i64>(3)? as u64)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u32,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
             )
             .optional()
     }
@@ -512,13 +567,16 @@ impl Db {
     }
 
     pub fn count_wrong_code(&self, email_hash: &str) -> rusqlite::Result<()> {
-        self.conn
-            .execute("UPDATE email_codes SET attempts = attempts + 1 WHERE email_hash = ?1", params![email_hash])?;
+        self.conn.execute(
+            "UPDATE email_codes SET attempts = attempts + 1 WHERE email_hash = ?1",
+            params![email_hash],
+        )?;
         Ok(())
     }
 
     pub fn clear_code(&self, email_hash: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM email_codes WHERE email_hash = ?1", params![email_hash])?;
+        self.conn
+            .execute("DELETE FROM email_codes WHERE email_hash = ?1", params![email_hash])?;
         Ok(())
     }
 
@@ -542,7 +600,7 @@ impl Db {
 
     /// Starts a session for the account with this id. Used for Discord logins, which find the
     /// account by its id, so the session follows it even after its email changes.
-    pub fn create_session_for_account(&self, token: &str, account_id: &str, now: u64) -> rusqlite::Result<()> {
+    pub fn create_account_session(&self, token: &str, account_id: &str, now: u64) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (token, email, created)
              SELECT ?1, email, ?3 FROM accounts WHERE id = ?2",
@@ -565,7 +623,9 @@ impl Db {
     pub fn delete_account(&mut self, email_hash: &str) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         let id: Option<String> = tx
-            .query_row("SELECT id FROM accounts WHERE email = ?1", params![email_hash], |row| row.get(0))
+            .query_row("SELECT id FROM accounts WHERE email = ?1", params![email_hash], |row| {
+                row.get(0)
+            })
             .optional()?;
         if let Some(id) = id {
             tx.execute("DELETE FROM discord_links WHERE account = ?1", params![id])?;
@@ -610,14 +670,17 @@ impl Db {
 
     /// Removes the Discord link of the account with this id.
     pub fn unlink_discord(&self, account_id: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM discord_links WHERE account = ?1", params![account_id])?;
+        self.conn
+            .execute("DELETE FROM discord_links WHERE account = ?1", params![account_id])?;
         Ok(())
     }
 
     /// The display name of the account with this id.
     pub fn name_of_account(&self, account_id: &str) -> rusqlite::Result<Option<String>> {
         self.conn
-            .query_row("SELECT name FROM accounts WHERE id = ?1", params![account_id], |row| row.get(0))
+            .query_row("SELECT name FROM accounts WHERE id = ?1", params![account_id], |row| {
+                row.get(0)
+            })
             .optional()
     }
 
@@ -635,13 +698,23 @@ impl Db {
     /// Creates an account for a Discord login. Its email is already confirmed by Discord, and it has
     /// no password, so password login can never reach it. Returns the new id, or `None` when the
     /// name, username or email is taken.
-    pub fn create_discord_account(&self, name: &str, username: &str, email: &str, now: u64) -> rusqlite::Result<Option<String>> {
+    pub fn create_discord_account(
+        &self,
+        name: &str,
+        username: &str,
+        email: &str,
+        now: u64,
+    ) -> rusqlite::Result<Option<String>> {
         if !self.create_account(name, username, email, "", now)? {
             return Ok(None);
         }
         self.set_verified(&hash_email(&self.key, email), true)?;
         self.conn
-            .query_row("SELECT id FROM accounts WHERE email = ?1", params![hash_email(&self.key, email)], |row| row.get(0))
+            .query_row(
+                "SELECT id FROM accounts WHERE email = ?1",
+                params![hash_email(&self.key, email)],
+                |row| row.get(0),
+            )
             .optional()
     }
 
@@ -649,7 +722,9 @@ impl Db {
     /// The stored TLS certificate and key (PEM), if one has been made.
     pub fn tls_identity(&self) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
-            .query_row("SELECT cert, key FROM tls_identity WHERE id = 1", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row("SELECT cert, key FROM tls_identity WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()
     }
 
@@ -669,149 +744,5 @@ impl Db {
 }
 
 #[cfg(test)]
-mod id_tests {
-    use super::*;
-
-    #[test]
-    fn an_account_keeps_its_id_when_its_name_or_username_changes() {
-        let key = [7u8; 32];
-        let db = Db::open(":memory:", key).unwrap();
-        let email = "someone@example.com";
-        let email_hash = hash_email(&key, email);
-        assert!(db.create_account("First", "first", email, "hash", 1).unwrap());
-        let (id, name) = db.account_by_name("First").unwrap().expect("created");
-        assert_eq!(name, "First");
-
-        assert!(db.set_display_name(&email_hash, "Renamed").unwrap());
-        assert!(db.set_username(&email_hash, "renamed_user").unwrap());
-
-        assert!(db.account_by_name("First").unwrap().is_none());
-        let (same_id, new_name) = db.account_by_name("Renamed").unwrap().expect("found by new name");
-        assert_eq!(same_id, id, "the id did not change");
-        assert_eq!(new_name, "Renamed");
-    }
-}
-
-#[cfg(test)]
-mod legacy_id_tests {
-    use super::*;
-
-    #[test]
-    fn a_legacy_account_gets_a_random_id_and_the_change_is_recorded() {
-        let key = [9u8; 32];
-        let db = Db::open(":memory:", key).unwrap();
-        assert!(db.create_account("Old", "old", "old@example.com", "hash", 1).unwrap());
-        // An account from before random ids: its id is its name.
-        db.conn.execute("UPDATE accounts SET id = 'Old' WHERE name = 'Old'", []).unwrap();
-        db.conn.execute("INSERT INTO locations (account, addr, seen) VALUES ('Old', '127.0.0.1:1', 1)", []).unwrap();
-        let mut db = db;
-        assert_eq!(db.migrate_legacy_ids().unwrap(), 1);
-        let (new_id, _) = db.account_by_name("Old").unwrap().unwrap();
-        assert_ne!(new_id, "Old");
-        assert_eq!(new_id.len(), 32, "random ids are 32 hex characters");
-        assert_eq!(db.locations_of(&new_id).unwrap(), vec!["127.0.0.1:1".to_string()], "locations follow");
-        assert_eq!(
-            db.migrations_for(&["Old".to_string()]).unwrap(),
-            vec![("Old".to_string(), new_id.clone())],
-            "chat servers can ask for the change"
-        );
-        // Nothing left to migrate the second time.
-        assert_eq!(db.migrate_legacy_ids().unwrap(), 0);
-    }
-}
-
-#[cfg(test)]
-mod verify_tests {
-    use super::*;
-
-    #[test]
-    fn an_email_is_confirmed_and_a_new_address_must_be_confirmed_again() {
-        let key = [9u8; 32];
-        let mut db = Db::open(":memory:", key).unwrap();
-        let email = "someone@example.com";
-        let email_hash = hash_email(&key, email);
-        assert!(db.create_account("Someone", "someone", email, "hash", 1).unwrap());
-        assert!(!db.is_verified(&email_hash).unwrap(), "new accounts start unconfirmed");
-
-        db.store_code(&email_hash, "code-hash", 1_000, 1).unwrap();
-        let (stored, expires, tries, sent) = db.pending_code(&email_hash).unwrap().expect("stored");
-        assert_eq!((stored.as_str(), expires, tries, sent), ("code-hash", 1_000, 0, 1));
-        db.count_wrong_code(&email_hash).unwrap();
-        assert_eq!(db.pending_code(&email_hash).unwrap().unwrap().2, 1);
-
-        db.set_verified(&email_hash, true).unwrap();
-        db.clear_code(&email_hash).unwrap();
-        assert!(db.is_verified(&email_hash).unwrap());
-        assert!(db.pending_code(&email_hash).unwrap().is_none());
-
-        // Changing the address clears the confirmation.
-        assert!(db.change_email(&email_hash, "new@example.com").unwrap());
-        let new_hash = hash_email(&key, "new@example.com");
-        assert!(!db.is_verified(&new_hash).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod discord_tests {
-    use super::*;
-
-    #[test]
-    fn a_discord_login_follows_its_account_when_the_email_changes() {
-        let key = [4u8; 32];
-        let mut db = Db::open(":memory:", key).unwrap();
-        let old_email = "before@example.com";
-        let id = db
-            .create_discord_account("Sky", "sky", old_email, 1)
-            .unwrap()
-            .expect("created");
-        assert!(db.is_verified(&hash_email(&key, old_email)).unwrap(), "Discord confirmed the email");
-        db.link_discord("discord-1", &id, "Sky").unwrap();
-
-        assert!(db.change_email(&hash_email(&key, old_email), "after@example.com").unwrap());
-        db.create_session_for_account("token-1", &id, 2).unwrap();
-        let account = db.session_account("token-1").unwrap().expect("session");
-        assert_eq!(account.id, id);
-        assert_eq!(account.email_hash, hash_email(&key, "after@example.com"));
-        assert_eq!(db.discord_account("discord-1").unwrap(), Some(id), "the link still holds");
-    }
-}
-
-#[cfg(test)]
-mod account_action_tests {
-    use super::*;
-
-    #[test]
-    fn deleting_an_account_removes_everything_it_left_behind() {
-        let key = [5u8; 32];
-        let mut db = Db::open(":memory:", key).unwrap();
-        let email = "gone@example.com";
-        let email_hash = hash_email(&key, email);
-        let id = db.create_discord_account("Gone", "gone", email, 1).unwrap().expect("created");
-        db.link_discord("discord-9", &id, "Gone").unwrap();
-        db.record_location(&id, "127.0.0.1:7878", 1).unwrap();
-        db.create_session_for_account("token-9", &id, 1).unwrap();
-        db.store_code(&email_hash, "code", 99, 1).unwrap();
-
-        db.delete_account(&email_hash).unwrap();
-
-        assert!(db.session_account("token-9").unwrap().is_none());
-        assert!(db.discord_account("discord-9").unwrap().is_none());
-        assert!(db.locations_of(&id).unwrap().is_empty());
-        assert!(db.pending_code(&email_hash).unwrap().is_none());
-        assert!(db.account_by_email(email).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_password_can_be_set_on_a_discord_account() {
-        let key = [6u8; 32];
-        let db = Db::open(":memory:", key).unwrap();
-        let email = "pw@example.com";
-        let email_hash = hash_email(&key, email);
-        db.create_discord_account("Pat", "pat", email, 1).unwrap().expect("created");
-        db.create_session_for_account("token-pw", &db.account_by_email(email).unwrap().unwrap().0, 1).unwrap();
-        assert!(db.session_account("token-pw").unwrap().unwrap().password_hash.is_empty());
-
-        db.set_password_hash(&email_hash, "new-hash").unwrap();
-        assert_eq!(db.session_account("token-pw").unwrap().unwrap().password_hash, "new-hash");
-    }
-}
+#[path = "tests/db.rs"]
+mod tests;
