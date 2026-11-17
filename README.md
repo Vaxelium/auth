@@ -5,7 +5,7 @@ every chat server. Chat servers ask it who a session token belongs to. They neve
 accounts.
 
 It keeps accounts in SQLite, hashes passwords with Argon2, and can sign people in with
-Discord and send email codes through Resend.
+an external login provider and send email codes through Resend.
 
 ## Running
 
