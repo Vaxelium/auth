@@ -165,8 +165,13 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
         AuthRequest::Profile { token } => return profile(db, &token),
         AuthRequest::RequestEmailCode { token } => return request_email_code(db, &token),
         AuthRequest::VerifyEmail { token, code } => return verify_email(db, &token, &code),
-        AuthRequest::UpdateProfile { token, name, username } => {
-            return update_profile(db, &token, name, username);
+        AuthRequest::UpdateProfile {
+            token,
+            name,
+            username,
+            password,
+        } => {
+            return update_profile(db, &token, name, username, password);
         }
         AuthRequest::SetAbout { token, bio, banner } => {
             return set_about(db, &token, bio, banner);
@@ -800,7 +805,13 @@ fn profile(db: &SharedDb, token: &str) -> AuthReply {
 
 /// Changes the display name and/or the username of the session's account. Usernames are
 /// lowercase letters, digits and underscores, 2 to 24 characters.
-fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Option<String>) -> AuthReply {
+fn update_profile(
+    db: &SharedDb,
+    token: &str,
+    name: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> AuthReply {
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
         Ok(None) => {
@@ -810,6 +821,22 @@ fn update_profile(db: &SharedDb, token: &str, name: Option<String>, username: Op
         }
         Err(e) => return AuthReply::Error { text: e.to_string() },
     };
+    // A new username needs the current password, as a change of email does.
+    if username.is_some() {
+        match password {
+            None => {
+                return AuthReply::Error {
+                    text: "enter your current password to change your username".into(),
+                }
+            }
+            Some(password) if !verify_password(&password, &account.password_hash) => {
+                return AuthReply::Error {
+                    text: "wrong password".into(),
+                }
+            }
+            Some(_) => {}
+        }
+    }
     let guard = db.lock().unwrap();
     if let Some(name) = name {
         let name = name.trim().to_string();
