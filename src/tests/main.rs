@@ -179,6 +179,36 @@ fn a_discord_login_waits_then_reports_what_discord_sent() {
 }
 
 #[test]
+fn a_password_can_be_changed_with_the_current_one() {
+    let db = shared();
+    let (token, _) = register(&db, "Sky", "sky@example.com", "the first password").unwrap();
+    assert!(matches!(
+        change_password(&db, &token, "wrong password", "a second password"),
+        AuthReply::Error { .. }
+    ));
+    assert!(matches!(
+        change_password(&db, &token, "the first password", "short"),
+        AuthReply::Error { .. }
+    ));
+    assert!(matches!(
+        change_password(&db, &token, "the first password", "a second password"),
+        AuthReply::PasswordChanged
+    ));
+    assert!(login(&db, "sky@example.com", "the first password").is_err());
+    assert!(login(&db, "sky@example.com", "a second password").is_ok());
+}
+
+#[test]
+fn a_discord_account_without_a_password_cannot_change_one() {
+    let db = shared();
+    let (token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();
+    assert!(matches!(
+        change_password(&db, &token, "anything", "a long enough password"),
+        AuthReply::Error { .. }
+    ));
+}
+
+#[test]
 fn a_password_must_be_set_before_an_account_can_be_deleted() {
     let db = shared();
     let (token, _) = finish_discord(&db, &discord_user("111", "Sky", Some("sky@example.com"), Some(true))).unwrap();

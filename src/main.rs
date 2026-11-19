@@ -237,6 +237,11 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
         }
         AuthRequest::DiscordStart { token } => return discord_start(db, pending, &token),
         AuthRequest::SetPassword { token, password } => return set_password(db, &token, &password),
+        AuthRequest::ChangePassword {
+            token,
+            current,
+            password,
+        } => return change_password(db, &token, &current, &password),
         AuthRequest::DeleteAccount { token, password } => return delete_account(db, &token, &password),
         AuthRequest::LinkedAccounts { token } => return linked_accounts(db, &token),
         AuthRequest::UnlinkDiscord { token } => return unlink_discord(db, &token),
@@ -658,18 +663,57 @@ fn store_outcome(pending: &PendingLogins, state: &str, outcome: Result<String, S
     }
 }
 
-/// Sets a password on an account that has none, such as one made with Discord.
-fn set_password(db: &SharedDb, token: &str, password: &str) -> AuthReply {
+/// Why a password is not allowed, if it is not: too short or too long.
+fn password_length_error(password: &str) -> Option<String> {
     let len = password.chars().count();
     if len < MIN_PASSWORD_LEN {
-        return AuthReply::Error {
-            text: format!("password must be at least {MIN_PASSWORD_LEN} characters"),
-        };
+        return Some(format!("password must be at least {MIN_PASSWORD_LEN} characters"));
     }
     if len > MAX_PASSWORD_LEN {
+        return Some(format!("password must be at most {MAX_PASSWORD_LEN} characters"));
+    }
+    None
+}
+
+/// Changes the password of an account that has one, after checking the current password.
+fn change_password(db: &SharedDb, token: &str, current: &str, password: &str) -> AuthReply {
+    if let Some(text) = password_length_error(password) {
+        return AuthReply::Error { text };
+    }
+    // Read the account, then release the lock before the slow password checks.
+    let account = match db.lock().unwrap().session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    if account.password_hash.is_empty() {
         return AuthReply::Error {
-            text: format!("password must be at most {MAX_PASSWORD_LEN} characters"),
+            text: "this account has no password yet, set one first".into(),
         };
+    }
+    if !verify_password(current, &account.password_hash) {
+        return AuthReply::Error {
+            text: "wrong password".into(),
+        };
+    }
+    let hash = match hash_password(password) {
+        Ok(hash) => hash,
+        Err(text) => return AuthReply::Error { text },
+    };
+    match db.lock().unwrap().set_password_hash(&account.email_hash, &hash) {
+        Ok(()) => AuthReply::PasswordChanged,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// Sets a password on an account that has none, such as one made with Discord.
+fn set_password(db: &SharedDb, token: &str, password: &str) -> AuthReply {
+    if let Some(text) = password_length_error(password) {
+        return AuthReply::Error { text };
     }
     let account = match db.lock().unwrap().session_account(token) {
         Ok(Some(account)) => account,
