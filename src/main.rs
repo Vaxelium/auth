@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
-use common::{is_valid_email, AuthReply, AuthRequest, DEFAULT_AUTH_ADDR};
+use common::{is_valid_email, AuthReply, AuthRequest, MentionTotal, ServerMentions, DEFAULT_AUTH_ADDR};
 use db::{username_from, Db};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,7 +51,8 @@ async fn run() -> anyhow::Result<()> {
             identity
         }
     };
-    let acceptor = common::tls::acceptor(&cert, &key)?;
+    // Chat servers present their own certificate, so the service can tell them apart. People's clients need not.
+    let acceptor = common::tls::acceptor_with_client_certs(&cert, &key)?;
     let db: SharedDb = Arc::new(Mutex::new(db));
     let pending: PendingLogins = Arc::default();
     if let Some(config) = discord::config() {
@@ -78,7 +79,8 @@ async fn run() -> anyhow::Result<()> {
                     return;
                 }
             };
-            if let Err(e) = handle_connection(socket, db, pending).await {
+            let certificate = common::tls::peer_fingerprint(&socket);
+            if let Err(e) = handle_connection(socket, db, pending, certificate).await {
                 if !common::tls::is_quiet_close(&e) {
                     eprintln!("{peer}: {e}");
                 }
@@ -124,7 +126,7 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 /// Reads requests line by line until the client disconnects.
-async fn handle_connection<S>(socket: S, db: SharedDb, pending: PendingLogins) -> anyhow::Result<()>
+async fn handle_connection<S>(socket: S, db: SharedDb, pending: PendingLogins, peer: Option<String>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -134,7 +136,7 @@ where
         let reply = match serde_json::from_str::<AuthRequest>(&line) {
             // Talks to Discord over the network, so it runs here rather than in `handle_request`.
             Ok(AuthRequest::DiscordPoll { state }) => discord_poll(&db, &pending, &state).await,
-            Ok(request) => handle_request(&db, &pending, request),
+            Ok(request) => handle_request(&db, &pending, request, peer.as_deref()),
             Err(e) => AuthReply::Error {
                 text: format!("bad request: {e}"),
             },
@@ -146,7 +148,55 @@ where
     Ok(())
 }
 
-fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) -> AuthReply {
+/// A chat server reports its members' mention totals. It must connect with its own certificate, and that
+/// certificate must be the one trusted for its server id.
+fn report_mentions(db: &SharedDb, peer: Option<&str>, server_id: &str, totals: &[MentionTotal]) -> AuthReply {
+    let Some(fingerprint) = peer else {
+        return AuthReply::Error {
+            text: "a server reports its mentions with its certificate".into(),
+        };
+    };
+    let db = db.lock().unwrap();
+    match db.trust_server(server_id, fingerprint) {
+        Ok(true) => {}
+        Ok(false) => {
+            return AuthReply::Error {
+                text: "this server's certificate has changed".into(),
+            }
+        }
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    }
+    let rows: Vec<(String, u32)> = totals.iter().map(|t| (t.account.clone(), t.total)).collect();
+    match db.set_mention_totals(server_id, &rows) {
+        Ok(()) => AuthReply::MentionsRecorded,
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+/// The account's mention totals, on each server that reported them.
+fn mention_totals(db: &SharedDb, token: &str) -> AuthReply {
+    let db = db.lock().unwrap();
+    let account = match db.session_account(token) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return AuthReply::Error {
+                text: "your session has expired, log in again".into(),
+            }
+        }
+        Err(e) => return AuthReply::Error { text: e.to_string() },
+    };
+    match db.mention_totals_of(&account.id) {
+        Ok(rows) => AuthReply::MentionTotals {
+            totals: rows
+                .into_iter()
+                .map(|(server_id, total)| ServerMentions { server_id, total })
+                .collect(),
+        },
+        Err(e) => AuthReply::Error { text: e.to_string() },
+    }
+}
+
+fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest, peer: Option<&str>) -> AuthReply {
     let result = match request {
         AuthRequest::Register { name, email, password } => register(db, &name, &email, &password),
         AuthRequest::Login { email, password } => login(db, &email, &password),
@@ -229,6 +279,8 @@ fn handle_request(db: &SharedDb, pending: &PendingLogins, request: AuthRequest) 
                 Err(e) => AuthReply::Error { text: e.to_string() },
             };
         }
+        AuthRequest::ReportMentions { server_id, totals } => return report_mentions(db, peer, &server_id, &totals),
+        AuthRequest::MentionTotals { token } => return mention_totals(db, &token),
         AuthRequest::Locate { id } => {
             return match db.lock().unwrap().locations_of(&id) {
                 Ok(addrs) => AuthReply::Locations { addrs },
