@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS tls_identity (
     cert TEXT NOT NULL,
     key  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS server_identities (
+    server_id   TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mention_totals (
+    server_id TEXT NOT NULL,
+    account   TEXT NOT NULL,
+    total     INTEGER NOT NULL,
+    PRIMARY KEY (server_id, account)
+);
 CREATE TABLE IF NOT EXISTS discord_links (
     discord_id TEXT PRIMARY KEY,
     account    TEXT NOT NULL
@@ -450,6 +460,50 @@ impl Db {
     }
 
     /// The servers an account was last seen at, most recent first.
+    /// Trusts a server by its certificate. The first certificate reported for a server id is remembered, and after
+    /// that only the same certificate is trusted. Returns false when it is a different one.
+    pub fn trust_server(&self, server_id: &str, fingerprint: &str) -> rusqlite::Result<bool> {
+        let known: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT fingerprint FROM server_identities WHERE server_id = ?1",
+                params![server_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match known {
+            None => {
+                self.conn.execute(
+                    "INSERT INTO server_identities (server_id, fingerprint) VALUES (?1, ?2)",
+                    params![server_id, fingerprint],
+                )?;
+                Ok(true)
+            }
+            Some(known) => Ok(known == fingerprint),
+        }
+    }
+
+    /// Stores a server's mention totals for accounts, replacing what it reported before for them.
+    pub fn set_mention_totals(&self, server_id: &str, totals: &[(String, u32)]) -> rusqlite::Result<()> {
+        for (account, total) in totals {
+            self.conn.execute(
+                "INSERT INTO mention_totals (server_id, account, total) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (server_id, account) DO UPDATE SET total = excluded.total",
+                params![server_id, account, total],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The account's mention totals on each server that reported them, as (server id, total).
+    pub fn mention_totals_of(&self, account: &str) -> rusqlite::Result<Vec<(String, u32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT server_id, total FROM mention_totals WHERE account = ?1")?;
+        let rows = stmt.query_map(params![account], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
     pub fn locations_of(&self, account: &str) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
             .conn

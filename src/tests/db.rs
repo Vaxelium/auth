@@ -174,3 +174,26 @@ mod account_action_tests {
         );
     }
 }
+
+mod mention_tests {
+    use super::super::*;
+
+    #[test]
+    fn a_server_is_trusted_by_the_certificate_it_first_reported() {
+        let db = Db::open(":memory:", [7u8; 32]).unwrap();
+        assert!(db.trust_server("srv-1", "aaa").unwrap(), "the first certificate is remembered");
+        assert!(db.trust_server("srv-1", "aaa").unwrap(), "the same certificate is trusted again");
+        assert!(!db.trust_server("srv-1", "bbb").unwrap(), "a different certificate is refused");
+    }
+
+    #[test]
+    fn mention_totals_are_kept_per_server_and_replaced_when_reported_again() {
+        let db = Db::open(":memory:", [7u8; 32]).unwrap();
+        db.set_mention_totals("srv-1", &[("acct-1".to_string(), 2)]).unwrap();
+        db.set_mention_totals("srv-2", &[("acct-1".to_string(), 5)]).unwrap();
+        db.set_mention_totals("srv-1", &[("acct-1".to_string(), 3)]).unwrap();
+        let mut totals = db.mention_totals_of("acct-1").unwrap();
+        totals.sort();
+        assert_eq!(totals, vec![("srv-1".to_string(), 3), ("srv-2".to_string(), 5)]);
+    }
+}
